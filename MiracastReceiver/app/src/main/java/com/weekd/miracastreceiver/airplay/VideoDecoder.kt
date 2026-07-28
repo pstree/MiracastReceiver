@@ -89,6 +89,7 @@ class VideoDecoder(private val outputSurface: Surface) {
         // Provisional size for StreamingScreen aspect-fit; replaced by the decoder's reported size.
         StreamStats.videoWidth = actualWidth
         StreamStats.videoHeight = actualHeight
+        StreamStats.videoCodec = MediaFormat.MIMETYPE_VIDEO_AVC
 
         // Create the MediaFormat that describes the H.264 stream to the hardware decoder
         val format = MediaFormat.createVideoFormat(

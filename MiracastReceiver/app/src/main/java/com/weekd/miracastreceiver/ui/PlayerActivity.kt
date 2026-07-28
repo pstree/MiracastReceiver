@@ -23,11 +23,13 @@ import android.view.SurfaceView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import com.weekd.miracastreceiver.R
@@ -97,6 +99,8 @@ class PlayerActivity : AppCompatActivity() {
     private lateinit var tvTitle: TextView
     private lateinit var progressBar: ProgressBar
     private lateinit var tvError: TextView
+    private lateinit var tvStreamInfo: TextView
+    private lateinit var bufferingIndicator: ProgressBar
 
     private var player: ExoPlayer? = null
     private var trackSelector: DefaultTrackSelector? = null
@@ -110,7 +114,15 @@ class PlayerActivity : AppCompatActivity() {
     private var qualityHeight: Int = QUALITY_AUTO
     private var rtpReceiver: RtpReceiver? = null
     private var isMiracastSession = false
+    private var isAirPlayMirrorSession = false
     private var airPlayAspectJob: Job? = null
+    private var currentSpeed = 1f
+
+    // 视频流信息面板
+    private val streamInfoTracker = StreamInfoTracker()
+    private var streamInfoJob: Job? = null
+    private var isStreamInfoVisible = false
+    private var bandwidthEstimateBps = 0L
 
     // Kodi 风格连续快进快退状态
     private var pendingSeekDeltaMs = 0L
@@ -143,7 +155,7 @@ class PlayerActivity : AppCompatActivity() {
                 ACTION_SET_SPEED -> {
                     val speed = intent.getFloatExtra(EXTRA_SPEED, 1f).coerceIn(0.25f, 4f)
                     player?.setPlaybackSpeed(speed)
-                    playerView.findViewById<TextView?>(R.id.tv_playback_speed)?.text = if (speed == 1f) "1.0x" else "${speed}x"
+                    currentSpeed = speed
                     tvStatus.text = "播放速度：${speed}x"
                     reportPlaybackPosition()
                 }
@@ -183,6 +195,8 @@ class PlayerActivity : AppCompatActivity() {
         tvTitle = findViewById(R.id.tv_title)
         progressBar = findViewById(R.id.progress_bar)
         tvError = findViewById(R.id.tv_error)
+        tvStreamInfo = findViewById(R.id.tv_stream_info)
+        bufferingIndicator = findViewById(R.id.buffering_indicator)
     }
 
     private fun initPlayer() {
@@ -230,6 +244,17 @@ class PlayerActivity : AppCompatActivity() {
                         tvError.visibility = View.VISIBLE
                     }
                 })
+                // 视频信息面板的「网速」取自带宽估计（ExoPlayer 默认的 DefaultBandwidthMeter 采样）
+                addAnalyticsListener(object : AnalyticsListener {
+                    override fun onBandwidthEstimate(
+                        eventTime: AnalyticsListener.EventTime,
+                        totalLoadTimeMs: Int,
+                        totalBytesLoaded: Long,
+                        bitrateEstimate: Long
+                    ) {
+                        bandwidthEstimateBps = bitrateEstimate
+                    }
+                })
             }
 
         playerView.player = player
@@ -243,15 +268,41 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun setupControllerActions() {
-        playerView.findViewById<View?>(R.id.btn_quality)?.setOnClickListener { showQualityDialog() }
-        playerView.findViewById<View?>(R.id.btn_fullscreen)?.setOnClickListener { toggleOrientation() }
-        playerView.findViewById<TextView?>(R.id.tv_playback_speed)?.setOnClickListener { showSpeedDialog(it as TextView) }
-        playerView.findViewById<View?>(R.id.btn_subtitle)?.setOnClickListener {
-            Toast.makeText(this, "字幕切换将随媒体字幕轨自动支持", Toast.LENGTH_SHORT).show()
-        }
+        playerView.findViewById<View?>(R.id.btn_more)?.setOnClickListener { showMoreMenu() }
         playerView.findViewById<View?>(R.id.exo_ffwd)?.setOnClickListener { handleSeekPress(forward = true) }
         playerView.findViewById<View?>(R.id.exo_rew)?.setOnClickListener { handleSeekPress(forward = false) }
     }
+
+    /** 「更多」弹窗：控制条精简后，低频功能都收到这里。 */
+    private fun showMoreMenu() {
+        val labels = arrayOf(
+            if (isStreamInfoVisible) "关闭视频信息" else "视频信息",
+            "画质",
+            "播放速度（${formatSpeedLabel(currentSpeed)}）",
+            "字幕",
+            "屏幕方向"
+        )
+        isDialogShowing = true
+        AlertDialog.Builder(this)
+            .setTitle("更多")
+            .setItems(labels) { _, which ->
+                // 本弹窗关闭后再打开下一级弹窗，否则 onDismiss 会把 isDialogShowing 误置回 false
+                tvStatus.post {
+                    when (which) {
+                        0 -> toggleStreamInfo()
+                        1 -> showQualityDialog()
+                        2 -> showSpeedDialog()
+                        3 -> Toast.makeText(this, "字幕切换将随媒体字幕轨自动支持", Toast.LENGTH_SHORT).show()
+                        4 -> toggleOrientation()
+                    }
+                }
+            }
+            .setOnDismissListener { isDialogShowing = false }
+            .show()
+    }
+
+    private fun formatSpeedLabel(speed: Float): String =
+        if (speed == 1f) "1.0x" else "${speed}x"
 
     /**
      * 参考 Kodi 的连续快进快退：短时间内连续按键会累加跳转步长并放大跨度，
@@ -316,6 +367,18 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN && !isDialogShowing) {
+            // 镜像/Miracast 没有控制条，INFO / MENU 键是信息面板的唯一入口
+            if (event.keyCode == KeyEvent.KEYCODE_INFO || event.keyCode == KeyEvent.KEYCODE_MENU) {
+                toggleStreamInfo()
+                return true
+            }
+            // 面板打开时返回键先关面板，不要直接结束播放
+            if (event.keyCode == KeyEvent.KEYCODE_BACK && isStreamInfoVisible) {
+                hideStreamInfo()
+                return true
+            }
+        }
         if (event.action == KeyEvent.ACTION_DOWN && !isCurrentImage() && !isDialogShowing) {
             val isForwardKey = event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
                 event.keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
@@ -377,6 +440,9 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun startAirPlayMirrorPlayback() {
         Timber.i("Starting AirPlay mirror playback")
+        isAirPlayMirrorSession = true
+        isMiracastSession = false
+        streamInfoTracker.reset()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         stopImageSlideShow()
         player?.clearVideoSurface()
@@ -465,6 +531,8 @@ class PlayerActivity : AppCompatActivity() {
 
         Timber.i("Starting Miracast playback: port=$rtpPort session=$sessionId")
         isMiracastSession = true
+        isAirPlayMirrorSession = false
+        streamInfoTracker.reset()
         stopImageSlideShow()
         player?.pause()
         playerView.visibility = View.VISIBLE
@@ -493,6 +561,9 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun playMedia(uri: String) {
         Timber.i("Playing media: $uri")
+        isMiracastSession = false
+        isAirPlayMirrorSession = false
+        streamInfoTracker.reset()
         stopImageSlideShow()
         imageView.visibility = View.GONE
         playerView.visibility = View.VISIBLE
@@ -622,7 +693,120 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun updateBufferingState(isBuffering: Boolean) {
         progressBar.visibility = if (isBuffering) View.VISIBLE else View.GONE
-        playerView.findViewById<View?>(R.id.buffering_indicator)?.visibility = if (isBuffering) View.VISIBLE else View.GONE
+        bufferingIndicator.visibility = if (isBuffering) View.VISIBLE else View.GONE
+    }
+
+    // ─── 视频流信息面板 ────────────────────────────────────────────────────
+    /** 切换信息面板。镜像/Miracast 没有控制条，只能靠遥控 INFO / MENU 键触发。 */
+    private fun toggleStreamInfo() {
+        if (isStreamInfoVisible) hideStreamInfo() else showStreamInfo()
+    }
+
+    private fun showStreamInfo() {
+        isStreamInfoVisible = true
+        streamInfoTracker.reset()
+        tvStreamInfo.text = buildStreamInfoText()
+        tvStreamInfo.visibility = View.VISIBLE
+        streamInfoJob?.cancel()
+        streamInfoJob = lifecycleScope.launch {
+            while (isActive) {
+                delay(1000)
+                tvStreamInfo.text = buildStreamInfoText()
+            }
+        }
+    }
+
+    private fun hideStreamInfo() {
+        isStreamInfoVisible = false
+        streamInfoJob?.cancel()
+        streamInfoJob = null
+        tvStreamInfo.visibility = View.GONE
+    }
+
+    private fun buildStreamInfoText(): String = when {
+        isAirPlayMirrorSession -> buildAirPlayStreamInfo()
+        isMiracastSession -> buildMiracastStreamInfo()
+        else -> buildExoPlayerStreamInfo()
+    }
+
+    /** DLNA / 普通网络播放：分辨率、帧率、码率取自当前视频轨，网速取带宽估计。 */
+    private fun buildExoPlayerStreamInfo(): String {
+        val currentPlayer = player
+        val format = currentPlayer?.videoFormat
+        val videoSize = currentPlayer?.videoSize
+        val bitrateBps = listOfNotNull(format?.bitrate, format?.averageBitrate, format?.peakBitrate)
+            .firstOrNull { it != Format.NO_VALUE }?.toLong() ?: 0L
+        return streamInfoLines(
+            resolution = StreamInfoTracker.formatResolution(videoSize?.width ?: 0, videoSize?.height ?: 0),
+            codec = StreamInfoTracker.formatCodec(format?.sampleMimeType),
+            fps = StreamInfoTracker.formatFps(format?.frameRate ?: 0f),
+            bitrate = StreamInfoTracker.formatBitrate(bitrateBps),
+            speed = StreamInfoTracker.formatSpeed(bandwidthEstimateBps / 8)
+        )
+    }
+
+    /** AirPlay 镜像：码率只算视频流，网速把音频流字节也算进去。 */
+    private fun buildAirPlayStreamInfo(): String {
+        val videoBytes = StreamStats.videoBytesTotal
+        val totalBytes = videoBytes + StreamStats.audioBytesTotal
+        val sample = streamInfoTracker.sample(totalBytes, StreamStats.videoFramesTotal)
+        // 视频码率 = 总码率中扣掉音频部分，按本次采样的视频/总字节比例折算
+        val videoShare = if (totalBytes > 0) videoBytes.toDouble() / totalBytes else 1.0
+        return streamInfoLines(
+            resolution = StreamInfoTracker.formatResolution(StreamStats.videoWidth, StreamStats.videoHeight),
+            codec = StreamInfoTracker.formatCodec(StreamStats.videoCodec),
+            fps = StreamInfoTracker.formatFps(sample.fps.toFloat()),
+            bitrate = StreamInfoTracker.formatBitrate((sample.bitrateBps * videoShare).toLong()),
+            speed = StreamInfoTracker.formatSpeed(sample.bytesPerSec)
+        )
+    }
+
+    /** Miracast：全部数据来自 RtpReceiver 的累计计数。 */
+    private fun buildMiracastStreamInfo(): String {
+        val receiver = rtpReceiver
+        val sample = streamInfoTracker.sample(receiver?.bytesReceived ?: 0L, receiver?.framesDecoded ?: 0L)
+        return streamInfoLines(
+            resolution = StreamInfoTracker.formatResolution(receiver?.videoWidth ?: 0, receiver?.videoHeight ?: 0),
+            codec = StreamInfoTracker.formatCodec(receiver?.videoCodec),
+            fps = StreamInfoTracker.formatFps(sample.fps.toFloat()),
+            bitrate = StreamInfoTracker.formatBitrate(sample.bitrateBps),
+            speed = StreamInfoTracker.formatSpeed(sample.bytesPerSec)
+        )
+    }
+
+    private fun streamInfoLines(
+        resolution: String,
+        codec: String,
+        fps: String,
+        bitrate: String,
+        speed: String
+    ): String {
+        val (displayW, displayH) = currentDisplaySize()
+        val rows = listOf(
+            "源分辨率" to resolution,
+            "显示分辨率" to StreamInfoTracker.formatResolution(displayW, displayH),
+            "视频编码" to codec,
+            "帧率" to fps,
+            "码率" to bitrate,
+            "网速" to speed
+        )
+        return rows.joinToString("\n", prefix = "视频信息\n") { (label, value) ->
+            StreamInfoTracker.padLabel(label) + value
+        }
+    }
+
+    /**
+     * 画面实际渲染到屏幕上的像素尺寸。
+     * PlayerView 会按比例把内容框缩到片源宽高比，所以这里拿到的是去掉黑边后的真实显示尺寸；
+     * 镜像模式则读 [fitAirPlaySurface] 调整过的镜像 Surface。视图还没测量时退回屏幕分辨率。
+     */
+    private fun currentDisplaySize(): Pair<Int, Int> {
+        val renderView = if (isAirPlayMirrorSession) airPlayMirrorSurfaceView else playerView.videoSurfaceView
+        val width = renderView?.width ?: 0
+        val height = renderView?.height ?: 0
+        if (width > 0 && height > 0) return width to height
+        val metrics = resources.displayMetrics
+        return metrics.widthPixels to metrics.heightPixels
     }
 
     private fun showQualityDialog() {
@@ -652,7 +836,7 @@ class PlayerActivity : AppCompatActivity() {
         tvStatus.text = if (height == QUALITY_AUTO) "画质：自动" else "画质：${height}p"
     }
 
-    private fun showSpeedDialog(speedView: TextView) {
+    private fun showSpeedDialog() {
         val labels = arrayOf("0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x")
         val speeds = floatArrayOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
         isDialogShowing = true
@@ -660,7 +844,8 @@ class PlayerActivity : AppCompatActivity() {
             .setTitle("播放速度")
             .setItems(labels) { _, which ->
                 player?.setPlaybackSpeed(speeds[which])
-                speedView.text = labels[which]
+                currentSpeed = speeds[which]
+                tvStatus.text = "播放速度：${labels[which]}"
             }
             .setOnDismissListener { isDialogShowing = false }
             .show()
@@ -708,12 +893,16 @@ class PlayerActivity : AppCompatActivity() {
             player?.play()
             startProgressUpdates()
         }
+        if (isStreamInfoVisible) showStreamInfo()
     }
 
     override fun onStop() {
         super.onStop()
         if (isCurrentImage()) stopImageSlideShow() else player?.pause()
         stopProgressUpdates()
+        // 保留 isStreamInfoVisible，回到前台时自动恢复刷新
+        streamInfoJob?.cancel()
+        streamInfoJob = null
         reportPlaybackPosition()
     }
 
@@ -778,6 +967,8 @@ class PlayerActivity : AppCompatActivity() {
         stopImageSlideShow()
         airPlayAspectJob?.cancel()
         airPlayAspectJob = null
+        streamInfoJob?.cancel()
+        streamInfoJob = null
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         rtpReceiver?.stop()
         rtpReceiver = null

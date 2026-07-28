@@ -174,6 +174,7 @@ class AudioStreamServer(
                 packet.length = buf.size      // reset capacity — receive() shrinks length to the last datagram
                 socket.receive(packet)
                 recv++
+                StreamStats.audioBytesTotal += packet.length
                 if (rtpCount < 6) {
                     Logger.i("Audio RTP[$rtpCount] ${packet.length}B hdr: ${hex(packet.data, minOf(20, packet.length))}")
                     rtpCount++

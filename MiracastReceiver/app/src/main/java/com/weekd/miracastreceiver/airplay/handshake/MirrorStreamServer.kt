@@ -98,6 +98,7 @@ class MirrorStreamServer(
                 }
                 val payload = ByteArray(payloadSize)
                 if (!readFully(input, payload, payloadSize)) break
+                StreamStats.videoBytesTotal += payloadSize
                 when (payloadType) {
                     0 -> {
                         // ALWAYS advance the AES-CTR keystream, in order, for every video payload —
@@ -120,6 +121,7 @@ class MirrorStreamServer(
     /** Bounded enqueue — if the decoder is behind, drop the oldest item to keep latency bounded. */
     private fun enqueue(item: Item) {
         framesIn++
+        StreamStats.videoFramesTotal++
         if (!queue.offer(item)) {
             queue.poll()
             queue.offer(item)

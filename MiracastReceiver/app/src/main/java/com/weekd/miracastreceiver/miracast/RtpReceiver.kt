@@ -23,9 +23,33 @@ class RtpReceiver(
     private var decoder: MediaCodec? = null
     private var surface: Surface? = null
 
-    // RTP 包统计
-    private var packetsReceived = 0
-    private var bytesReceived = 0L
+    // RTP 包统计。UI（视频信息面板）会按秒轮询这些累计值做差分，故用 volatile 暴露只读属性。
+    @Volatile
+    var packetsReceived = 0
+        private set
+
+    @Volatile
+    var bytesReceived = 0L
+        private set
+
+    /** 已送显的解码帧数，UI 据此换算实时帧率。 */
+    @Volatile
+    var framesDecoded = 0L
+        private set
+
+    /** 解码器实际使用的 MIME（Miracast 规范固定为 H.264）。 */
+    @Volatile
+    var videoCodec = ""
+        private set
+
+    // 解码器上报的实际画面尺寸（初始化时按 1920x1080 配置，实际值以输出格式为准）
+    @Volatile
+    var videoWidth = 0
+        private set
+
+    @Volatile
+    var videoHeight = 0
+        private set
 
     // H.264 NAL 单元缓冲
     private val nalBuffer = mutableListOf<ByteArray>()
@@ -249,13 +273,39 @@ class RtpReceiver(
             val bufferInfo = MediaCodec.BufferInfo()
             var outputBufferIndex = decoder.dequeueOutputBuffer(bufferInfo, 0)
 
-            while (outputBufferIndex >= 0) {
-                decoder.releaseOutputBuffer(outputBufferIndex, true)
+            while (outputBufferIndex != MediaCodec.INFO_TRY_AGAIN_LATER) {
+                when {
+                    outputBufferIndex >= 0 -> {
+                        decoder.releaseOutputBuffer(outputBufferIndex, true)
+                        framesDecoded++
+                    }
+                    outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        // 解码器解析 SPS 后才知道真实分辨率
+                        readOutputSize(decoder.outputFormat)
+                        Timber.i("Miracast decoder output format: ${videoWidth}x$videoHeight")
+                    }
+                }
                 outputBufferIndex = decoder.dequeueOutputBuffer(bufferInfo, 0)
             }
 
         } catch (e: Exception) {
             Timber.e(e, "Error decoding NAL unit")
+        }
+    }
+
+    /**
+     * 读取解码器输出尺寸。优先用 crop 矩形（KEY_WIDTH/KEY_HEIGHT 常是对齐后的补齐尺寸，
+     * 例如 1080p 会报成 1088 高）。
+     */
+    private fun readOutputSize(format: MediaFormat) {
+        val hasCrop = format.containsKey("crop-left") && format.containsKey("crop-right") &&
+                format.containsKey("crop-top") && format.containsKey("crop-bottom")
+        if (hasCrop) {
+            videoWidth = format.getInteger("crop-right") - format.getInteger("crop-left") + 1
+            videoHeight = format.getInteger("crop-bottom") - format.getInteger("crop-top") + 1
+        } else {
+            videoWidth = format.getInteger(MediaFormat.KEY_WIDTH)
+            videoHeight = format.getInteger(MediaFormat.KEY_HEIGHT)
         }
     }
 
@@ -273,6 +323,7 @@ class RtpReceiver(
 
             decoder?.configure(format, surface, null, 0)
             decoder?.start()
+            videoCodec = MediaFormat.MIMETYPE_VIDEO_AVC
 
             Timber.i("H.264 decoder initialized")
         } catch (e: Exception) {

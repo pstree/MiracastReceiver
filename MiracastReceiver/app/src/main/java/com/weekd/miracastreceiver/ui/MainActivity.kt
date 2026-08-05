@@ -1,8 +1,13 @@
 package com.weekd.miracastreceiver.ui
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.weekd.miracastreceiver.R
 import com.weekd.miracastreceiver.discovery.DeviceInfoProvider
@@ -29,13 +34,61 @@ class MainActivity : AppCompatActivity() {
 
     private var connectionCode: String = ""
 
+    companion object {
+        private const val REQUEST_CODE_PERMISSIONS = 1001
+
+        /**
+         * Wi-Fi Direct 需要的危险权限，必须运行时申请。
+         *
+         * 少了它 `WifiP2pManager.createGroup()` 会抛 SecurityException，Miracast 直接不可用
+         * （AirPlay / DLNA 不受影响）。Android 13+ 用 NEARBY_WIFI_DEVICES 取代定位权限。
+         */
+        private val WIFI_DIRECT_PERMISSIONS: Array<String>
+            get() = if (Build.VERSION.SDK_INT >= 33) {
+                arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
+            } else {
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         initServices()
         initViews()
+        requestWifiDirectPermissions()
         checkNetworkAndStart()
+    }
+
+    private fun requestWifiDirectPermissions() {
+        val missing = WIFI_DIRECT_PERMISSIONS.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            Timber.i("Requesting Wi-Fi Direct permissions: $missing")
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), REQUEST_CODE_PERMISSIONS)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_CODE_PERMISSIONS) return
+
+        val granted = grantResults.isNotEmpty() &&
+            grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+        if (granted) {
+            // 权限是在服务启动之后才拿到的，重启一次服务让 Wi-Fi Direct 重新初始化
+            Timber.i("Wi-Fi Direct permissions granted, restarting cast service")
+            startCastService()
+        } else {
+            Timber.w("Wi-Fi Direct permissions denied — Miracast unavailable")
+            tvStatus.text = "未授予定位权限，Windows 无线投屏不可用"
+        }
     }
 
     private fun initServices() {

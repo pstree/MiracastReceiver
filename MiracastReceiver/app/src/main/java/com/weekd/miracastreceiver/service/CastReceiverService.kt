@@ -102,8 +102,17 @@ class CastReceiverService : Service() {
                         flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                     }
                     startActivity(intent)
-                } else if (state != com.weekd.miracastreceiver.airplay.AirPlayState.CONNECTED) {
+                } else if (state != com.weekd.miracastreceiver.airplay.AirPlayState.CONNECTED &&
+                    airPlayPlayerStarted
+                ) {
+                    // iPhone 结束镜像（TEARDOWN 或连接断开）后必须主动关掉播放页，
+                    // 否则画面会一直停在最后一帧。只在确实由 AirPlay 拉起过播放页时才发，
+                    // 免得误关正在播放的 DLNA 内容。
                     airPlayPlayerStarted = false
+                    Timber.i("AirPlay disconnected ($state), closing player")
+                    sendBroadcast(Intent(com.weekd.miracastreceiver.ui.PlayerActivity.ACTION_STOP).apply {
+                        setPackage(packageName)
+                    })
                 }
             },
             onSenderNameChanged = { sender -> Timber.i("AirPlay sender: $sender") }

@@ -164,10 +164,12 @@ cd MiracastReceiver
   - 优化屏幕镜像稳定性和延迟
   - 优化音视频同步
 
-- **开发 Windows 无线投屏**
-  - 深入适配 Miracast / Wi-Fi Display 协议
-  - 完善 RTSP/RTP/H.264 接收链路
-  - 探索 Windows "无线显示器" 自动发现和连接方案
+- **完善 Windows 无线投屏**（视频已可用，见 [Root 配置说明](Windows无线投屏Root配置说明.md)）
+  - **音频支持** —— 目前只解码视频轨，Windows 的声音尚未播放。TS 流里已带 AAC 音频轨，
+    需要在 `TsDemuxer` 里解出音频 PID 并接到 `AudioTrack`
+  - 进一步压低延迟（当前约 60–130 ms）
+  - 支持 `wfd_idr_request_capability`，丢包后主动请求关键帧以加快恢复
+  - 探索按需建组，避免常驻占用 Wi-Fi Direct 接口
 
 ### 🤝 贡献
 
@@ -318,10 +320,13 @@ Output APKs: `app/build/outputs/apk/`
   - Optimize screen mirroring stability and latency
   - Improve audio-video synchronization
 
-- **Develop Windows Wireless Display**
-  - Deep adaptation of Miracast / Wi-Fi Display protocol
-  - Improve RTSP/RTP/H.264 reception pipeline
-  - Explore Windows "Wireless Display" auto-discovery and connection solutions
+- **Complete Windows Wireless Display** (video works — see [Root Setup Guide](Windows无线投屏Root配置说明.md))
+  - **Audio support** — only the video track is decoded today, so Windows audio stays silent.
+    The AAC track is already in the TS stream; `TsDemuxer` needs to extract the audio PID
+    and route it to `AudioTrack`
+  - Push latency down further (currently ~60–130 ms)
+  - Support `wfd_idr_request_capability` to request a keyframe after packet loss
+  - Explore on-demand group creation instead of holding the Wi-Fi Direct interface permanently
 
 ### 🤝 Contributing
 

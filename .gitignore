@@ -112,3 +112,7 @@ apksigner
 
 # Release build artifacts (kept locally / attached to GitHub Releases only)
 releases/
+# tools/ 下的诊断工具编译产物（ARM 二进制，源码已跟踪，按需重新编译）
+tools/wfdprobe
+tools/rtsptry
+tools/wfdsink

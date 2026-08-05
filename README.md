@@ -40,10 +40,12 @@
   - VLC Player
   - Emby、Plex 等媒体服务器
 
-- **🖥️ Miracast/WFD**：Windows 无线显示器协议（基础支持）
-  - RTSP 服务器
-  - RTP/H.264 视频流接收
-  - Wi-Fi Direct P2P
+- **🖥️ Miracast/WFD**：Windows 无线显示器协议（**需要 root**）
+  - 完整 RTSP 会话协商（M1–M7）
+  - MPEG-2 TS 解复用 + H.264 硬解码，直送 MediaCodec 低延迟渲染
+  - Wi-Fi Direct P2P + WFD IE 注入（Windows `Win+K` 可直接发现）
+  - 端到端延迟约 60–130 ms，可作为 Windows 的无线第二屏幕
+  - 详见 [Windows 无线投屏 Root 配置说明](Windows无线投屏Root配置说明.md)
 
 - **🎬 强大的播放能力**
   - 支持 HTTP/HTTPS 视频流
@@ -60,7 +62,7 @@
 | iPhone/iPad | AirPlay | ✅ 完美支持 | 屏幕镜像、视频、音频投屏 |
 | Android 手机 | DLNA | ✅ 完美支持 | Bilibili、优酷等 App |
 | Windows | DLNA | ✅ 完美支持 | 媒体播放器投屏 |
-| Windows | Miracast | ⚠️ 受限支持 | 需手动 Wi-Fi Direct 配对 |
+| Windows | Miracast | ✅ 支持（需 root） | `Win+K` 直接发现，可当无线第二屏幕 |
 | Mac | AirPlay | ✅ 完美支持 | 系统原生支持 |
 | Emby/Plex | DLNA | ✅ 兼容 | 媒体服务器投屏 |
 
@@ -128,7 +130,8 @@ cd MiracastReceiver
 ### 📖 文档
 
 - [开发与调试指南](开发与调试指南.md) - 完整的开发、打包、安装和调试说明
-- [Windows 无线显示器](Windows无线显示器支持说明.md) - Miracast 协议说明和限制
+- [Windows 无线投屏 Root 配置说明](Windows无线投屏Root配置说明.md) - Miracast 启用步骤、协议实现要点与排错
+- [Windows 无线显示器](Windows无线显示器支持说明.md) - Miracast 协议背景说明
 
 ### 🔧 技术栈
 
@@ -146,10 +149,11 @@ cd MiracastReceiver
 
 ### 🐛 已知问题
 
-1. **Windows 无线显示器自动发现**
-   - 由于 Android 系统限制，普通应用无法完全模拟 Miracast Sink
-   - Windows "Win+K" 无法自动发现设备
-   - 需要通过手动 Wi-Fi Direct 配对或使用 DLNA 投屏
+1. **Windows 无线显示器需要 root**
+   - `CONFIGURE_WIFI_DISPLAY` 是 signature 级权限，普通应用无法广播 WFD IE
+   - 已 root 的设备可由应用自动注入，Windows `Win+K` 能直接发现
+   - **未 root 的设备无法使用**，请改用 DLNA 投屏
+   - 详见 [Windows 无线投屏 Root 配置说明](Windows无线投屏Root配置说明.md)
 
 2. **Emby 投屏兼容性**
    - 部分 Emby 客户端的 SOAP 请求格式可能需要特殊处理
@@ -190,10 +194,12 @@ cd MiracastReceiver
   - VLC Player
   - Emby, Plex media servers
 
-- **🖥️ Miracast/WFD**: Windows Wireless Display protocol (basic support)
-  - RTSP server
-  - RTP/H.264 video stream reception
-  - Wi-Fi Direct P2P
+- **🖥️ Miracast/WFD**: Windows Wireless Display protocol (**root required**)
+  - Full RTSP session negotiation (M1–M7)
+  - MPEG-2 TS demuxing + H.264 hardware decoding, fed straight to MediaCodec
+  - Wi-Fi Direct P2P with WFD IE injection (discoverable via `Win+K`)
+  - ~60–130 ms end-to-end latency, usable as a wireless second display
+  - See [Root Setup Guide](Windows无线投屏Root配置说明.md) (Chinese)
 
 - **🎬 Powerful Playback**
   - HTTP/HTTPS video streams
@@ -210,7 +216,7 @@ cd MiracastReceiver
 | iPhone/iPad | AirPlay | ✅ Perfect | Screen mirroring, video, audio casting |
 | Android | DLNA | ✅ Perfect | Bilibili, Youku apps |
 | Windows | DLNA | ✅ Perfect | Media player casting |
-| Windows | Miracast | ⚠️ Limited | Manual Wi-Fi Direct pairing required |
+| Windows | Miracast | ✅ Supported (root) | Discoverable via `Win+K`, works as second display |
 | Mac | AirPlay | ✅ Perfect | Native system support |
 | Emby/Plex | DLNA | ✅ Compatible | Media server casting |
 
@@ -278,7 +284,8 @@ Output APKs: `app/build/outputs/apk/`
 ### 📖 Documentation
 
 - [Development Guide](开发与调试指南.md) - Complete development, packaging, installation, and debugging instructions (Chinese)
-- [Windows Wireless Display](Windows无线显示器支持说明.md) - Miracast protocol explanation and limitations (Chinese)
+- [Miracast Root Setup](Windows无线投屏Root配置说明.md) - Enabling steps, protocol implementation notes, troubleshooting (Chinese)
+- [Windows Wireless Display](Windows无线显示器支持说明.md) - Miracast protocol background (Chinese)
 
 ### 🔧 Tech Stack
 
@@ -296,10 +303,11 @@ Output APKs: `app/build/outputs/apk/`
 
 ### 🐛 Known Issues
 
-1. **Windows Wireless Display Auto-Discovery**
-   - System limitations prevent full Miracast Sink emulation
-   - Windows "Win+K" cannot auto-discover the device
-   - Use manual Wi-Fi Direct pairing or DLNA casting
+1. **Windows Wireless Display Requires Root**
+   - `CONFIGURE_WIFI_DISPLAY` is a signature-level permission, so ordinary apps cannot broadcast the WFD IE
+   - On rooted devices the app injects it automatically and `Win+K` finds the device
+   - **Non-rooted devices cannot use this feature** — use DLNA casting instead
+   - See [Root Setup Guide](Windows无线投屏Root配置说明.md) (Chinese)
 
 2. **Emby Casting Compatibility**
    - Some Emby clients may require special SOAP format handling

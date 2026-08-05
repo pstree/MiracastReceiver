@@ -46,6 +46,22 @@ class VideoDecoder(private val outputSurface: Surface) {
         private set
 
     /**
+     * 专用的输出线程。
+     *
+     * 原先只在 [decodeNalUnit] 里排空输出队列，意味着第 N 帧解码完成后要**等第 N+1 帧到达**
+     * 才会被送显 —— 系统性地多出整整一个帧间隔（60fps 下 16ms）。屏幕镜像是实时链路，
+     * 这部分延迟纯属浪费，所以改成独立线程阻塞等待，解码器一吐帧就立刻送显。
+     *
+     * MediaCodec 同步模式下「输入在一条线程、输出在另一条线程」是官方支持的用法。
+     * 但 [release] 必须先停掉本线程并等它退出，再释放 codec —— 一边 dequeue 一边 release
+     * 会直接把进程搞崩（native 层的互斥量被销毁）。
+     */
+    private var outputThread: Thread? = null
+
+    @Volatile
+    private var outputRunning = false
+
+    /**
      * Initializes the MediaCodec decoder with the video stream parameters from the SDP.
      *
      * This must be called ONCE before any calls to [decodeNalUnit].
@@ -104,6 +120,14 @@ class VideoDecoder(private val outputSurface: Surface) {
             // NOTE: do NOT set KEY_MAX_WIDTH/HEIGHT here — this SoC's MStar decoder rejects
             // adaptive playback (BadParameter / buffer-count failures) and produces banding.
             // Resolution changes are handled by recreating the decoder in MirrorStreamServer.
+
+            // 低延迟提示。屏幕镜像（AirPlay / Miracast）要的是「解出一帧立刻显示」，
+            // 而解码器默认会攒几帧输出缓冲以提高吞吐，那会平白增加上百毫秒延迟。
+            // 解码器不认识的 key 会被忽略，所以这里全部设上、按平台各取所需：
+            setInteger("low-latency", 1)                        // Android 11+ 标准 key
+            setInteger("vendor.qti-ext-dec-low-latency.enable", 1)  // 高通
+            setInteger("vendor.low-latency.enable", 1)              // 部分联发科/展锐
+            setInteger(MediaFormat.KEY_PRIORITY, 0)            // 0 = 实时任务
         }
 
         // Create the hardware H.264 decoder.
@@ -120,7 +144,42 @@ class VideoDecoder(private val outputSurface: Surface) {
         mediaCodec!!.start()
 
         isInitialized = true
+        startOutputThread()
         Logger.i("H.264 decoder initialized successfully")
+    }
+
+    /** 启动输出线程：阻塞等待解码完成的帧并立即送显。 */
+    private fun startOutputThread() {
+        outputRunning = true
+        outputThread = Thread({
+            val bufferInfo = MediaCodec.BufferInfo()
+            while (outputRunning) {
+                val codec = mediaCodec ?: break
+                try {
+                    // 阻塞等待而不是轮询：解码器一有输出就立刻返回，延迟最低
+                    val index = codec.dequeueOutputBuffer(bufferInfo, OUTPUT_BUFFER_TIMEOUT_US)
+                    when {
+                        index >= 0 -> codec.releaseOutputBuffer(index, true)
+                        index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
+                            publishOutputSize(codec.outputFormat)
+                        // INFO_TRY_AGAIN_LATER：超时无输出，继续等
+                    }
+                } catch (e: IllegalStateException) {
+                    if (outputRunning) {
+                        Logger.e("VideoDecoder output thread: codec in error state", e)
+                        isHealthy = false
+                    }
+                    break
+                } catch (e: Exception) {
+                    if (outputRunning) Logger.e("VideoDecoder output thread error", e)
+                    break
+                }
+            }
+            Logger.d("VideoDecoder output thread exited")
+        }, "VideoDecoderOutput").apply {
+            priority = Thread.MAX_PRIORITY      // 送显是延迟敏感路径
+            start()
+        }
     }
 
     /**
@@ -147,10 +206,8 @@ class VideoDecoder(private val outputSurface: Surface) {
         }
 
         try {
-            // Drain finished frames FIRST — renders them and frees the pipeline so an input
-            // buffer becomes available. Dropping NAL units corrupts H.264 (loses reference
-            // frames) and causes a black screen until the next keyframe, so we avoid it.
-            releaseOutputBuffers(codec)
+            // 输出队列的排空交给专用输出线程（见 startOutputThread），这里只管喂输入。
+            // 原先在这里排空会导致每帧要等下一帧到达才送显，白白多一个帧间隔的延迟。
 
             // Wait for an input buffer. Longer than before: on a modest SoC the decoder can
             // briefly fall behind, and waiting beats dropping (which corrupts the stream).
@@ -176,11 +233,6 @@ class VideoDecoder(private val outputSurface: Surface) {
                 // Drop this NAL unit to avoid building up backlog (prefer low latency).
                 Logger.v("VideoDecoder: no input buffer available, dropping NAL unit")
             }
-
-            // Release any output buffers that MediaCodec has finished decoding.
-            // render=true means the frame goes to the Surface immediately.
-            releaseOutputBuffers(codec)
-
         } catch (e: IllegalStateException) {
             // MediaCodec is now in the error state and cannot recover — flag for recreation.
             Logger.e("VideoDecoder entered error state — will recreate", e)
@@ -190,36 +242,13 @@ class VideoDecoder(private val outputSurface: Surface) {
         }
     }
 
-    /**
-     * Releases any decoded output buffers back to MediaCodec and renders them to the Surface.
-     *
-     * MediaCodec works asynchronously: we put encoded data in input buffers,
-     * and decoded frames appear in output buffers. We must release each output
-     * buffer back to MediaCodec after rendering, or we'll run out of buffers.
-     *
-     * render=true: the frame is rendered to the Surface (displayed on TV).
-     * render=false: the frame is discarded (used to flush without displaying).
-     *
-     * @param codec The active MediaCodec instance.
+    /*
+     * 送显策略（原 releaseOutputBuffers 的注释，逻辑已移入输出线程）：
+     * 一律 releaseOutputBuffer(index, true) 立即渲染，刻意**不**做定时送显来对齐音画 ——
+     * 这个 Surface 的 BufferQueue 只有约 3 帧，任何等待都会迅速反压到解码器，
+     * 导致上游队列积压、延迟飙升并丢帧（丢帧即花屏）。
+     * 音画对齐靠 AudioStreamServer 保持音频路径低延迟来实现。
      */
-    private fun releaseOutputBuffers(codec: MediaCodec) {
-        val bufferInfo = MediaCodec.BufferInfo()
-        var outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-
-        while (outputBufferIndex >= 0 || outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-            if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                // The decoder parsed the real size from the SPS — authoritative for aspect-fit.
-                publishOutputSize(codec.outputFormat)
-            } else {
-                // Render immediately. We deliberately do NOT schedule a future render time for A/V sync:
-                // this Surface's BufferQueue holds only ~3 frames, so any hold quickly back-pressures the
-                // decoder → the upstream frame queue saturates → big latency + dropped (corrupt) frames.
-                // A/V alignment is handled by keeping the AUDIO path low-latency instead (AudioStreamServer).
-                codec.releaseOutputBuffer(outputBufferIndex, true)
-            }
-            outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-        }
-    }
 
     /** Reads the decoder's true display size (honouring the crop rectangle) for StreamingScreen. */
     private fun publishOutputSize(format: MediaFormat) {
@@ -248,6 +277,17 @@ class VideoDecoder(private val outputSurface: Surface) {
      */
     fun release() {
         Logger.d("Releasing VideoDecoder")
+
+        // 必须先停掉输出线程并等它真正退出，再释放 codec。
+        // 一边 dequeueOutputBuffer 一边 release 会在 native 层销毁仍在使用的互斥量，
+        // 直接 SIGABRT 崩掉整个进程（AudioStreamServer 里踩过同类问题）。
+        outputRunning = false
+        outputThread?.let { thread ->
+            runCatching { thread.join(500) }
+            if (thread.isAlive) Logger.w("VideoDecoder output thread did not exit in time")
+        }
+        outputThread = null
+
         try {
             mediaCodec?.stop()
             mediaCodec?.release()
@@ -266,6 +306,10 @@ class VideoDecoder(private val outputSurface: Surface) {
         // How long to wait for an input buffer before dropping (microseconds).
         // 100ms — generous enough that the decoder rarely has to drop a NAL unit (which would
         // corrupt the stream), while still bounding stall if the codec is truly wedged.
+        // 输出线程每次阻塞等待的上限（微秒）。20ms 比一帧还短，解码器有输出会立刻返回；
+        // 超时只是为了让线程有机会检查退出标志，不影响送显延迟。
+        private const val OUTPUT_BUFFER_TIMEOUT_US = 20_000L
+
         private const val INPUT_BUFFER_TIMEOUT_US = 100_000L
 
         /**

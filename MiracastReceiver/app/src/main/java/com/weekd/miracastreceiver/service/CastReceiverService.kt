@@ -19,6 +19,7 @@ import com.weekd.miracastreceiver.discovery.DeviceInfoProvider
 import com.weekd.miracastreceiver.dlna.DlnaMediaRenderer
 import com.weekd.miracastreceiver.dlna.SsdpServer
 import com.weekd.miracastreceiver.dlna.UpnpHttpServer
+import com.weekd.miracastreceiver.miracast.WfdRootHelper
 import com.weekd.miracastreceiver.miracast.WfdServer
 import com.weekd.miracastreceiver.miracast.WifiDirectManager
 import com.weekd.miracastreceiver.utils.NetworkUtils
@@ -90,7 +91,7 @@ class CastReceiverService : Service() {
             mirrorWidth = mirrorResolution.first,
             mirrorHeight = mirrorResolution.second,
             audioEnabled = true,
-            videoSurfaceProvider = { com.weekd.miracastreceiver.ui.PlayerActivity.airPlayMirrorSurface },
+            videoSurfaceProvider = { com.weekd.miracastreceiver.ui.PlayerActivity.mirrorSurface },
             onStateChanged = { state ->
                 Timber.i("AirPlay state: $state")
                 if (state == com.weekd.miracastreceiver.airplay.AirPlayState.CONNECTED && !airPlayPlayerStarted) {
@@ -146,12 +147,17 @@ class CastReceiverService : Service() {
                 Timber.i("Miracast stream started on RTP port: $rtpPort")
             }
             onStreamStopped = {
-                Timber.i("Miracast stream stopped")
+                Timber.i("Miracast stream stopped, closing player")
+                // Windows 断开（RTSP 连接关闭或 TEARDOWN）后必须主动关掉播放页，
+                // 否则手机会一直停在最后一帧画面上
+                sendBroadcast(Intent(com.weekd.miracastreceiver.ui.PlayerActivity.ACTION_STOP).apply {
+                    setPackage(packageName)
+                })
             }
         }
 
         // 初始化 Wi-Fi Direct 以支持 Windows 无线显示器发现
-        wifiDirectManager = WifiDirectManager(this).apply {
+        wifiDirectManager = WifiDirectManager(this, DeviceInfoProvider(this).getDeviceName()).apply {
             onGroupCreated = { group ->
                 Timber.i("Wi-Fi Direct group created for Miracast: ${group.networkName}")
             }
@@ -294,9 +300,15 @@ class CastReceiverService : Service() {
         upnpHttpServer.start()
         ssdpServer.start()
 
-        // 启动 Windows 无线显示器（Miracast/WFD）RTSP 服务
-        wfdServer.start()
+        // 启动 Windows 无线显示器（Miracast/WFD）
+        // 先建 P2P 组，再注入 WFD IE —— 顺序反了的话建组会覆盖掉刚设的 IE。
         wifiDirectManager.start()
+        if (WfdRootHelper.advertiseSink(this)) {
+            Timber.i("Miracast: 已作为 Wi-Fi Display Sink 对外广播，Windows 可发现")
+        } else {
+            Timber.w("Miracast: 未能注入 WFD IE（需要 root），Windows 无法发现本机")
+        }
+        wfdServer.start()
 
         Timber.i("All cast services started (AirPlay + DLNA + Miracast/WFD)")
 
@@ -304,6 +316,14 @@ class CastReceiverService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /** 用户从最近任务里划掉应用时也要断开投屏，否则发送端会以为连接还在。 */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Timber.i("Task removed, tearing down cast sessions")
+        shutdownMiracast()
+        super.onTaskRemoved(rootIntent)
+        stopSelf()
+    }
 
     override fun onDestroy() {
         super.onDestroy()
@@ -322,9 +342,19 @@ class CastReceiverService : Service() {
         ssdpServer.stop()
         upnpHttpServer.stop()
 
-        // 停止 Miracast/WFD 服务
-        wifiDirectManager.stop()
-        wfdServer.stop()
+        shutdownMiracast()
+    }
+
+    /**
+     * 断开 Miracast 并停止对外广播。
+     *
+     * 注意 WFD IE 和 P2P 组都存在 wpa_supplicant（系统进程）里，**不随应用退出而消失**。
+     * 不主动撤销的话，应用关掉之后 Windows 依然能搜到这台设备并尝试连接。
+     */
+    private fun shutdownMiracast() {
+        runCatching { wfdServer.stop() }
+        runCatching { WfdRootHelper.stopAdvertising(this) }
+        runCatching { wifiDirectManager.stop() }
     }
 
     private fun generateDeviceUuid(): String {

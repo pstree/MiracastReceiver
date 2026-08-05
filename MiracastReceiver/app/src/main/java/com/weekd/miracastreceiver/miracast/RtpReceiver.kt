@@ -1,362 +1,203 @@
 package com.weekd.miracastreceiver.miracast
 
-import android.media.MediaCodec
-import android.media.MediaFormat
 import android.view.Surface
 import kotlinx.coroutines.*
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import timber.log.Timber
 import java.net.DatagramPacket
 import java.net.DatagramSocket
-import java.nio.ByteBuffer
 
 /**
- * RTP 视频流接收器
- * 接收并解析 RTP 包，提取 H.264 视频数据
+ * Miracast RTP 接收器。
+ *
+ * 实测确认（对 Windows 11 的 MSMiracastSource）：Miracast 的 RTP 负载类型是 33 = MP2T，
+ * 也就是 **H.264 封装在 MPEG-2 传输流里**，而不是裸 H.264 分片。每个 RTP 包 1328 字节 =
+ * 12 字节 RTP 头 + 7 × 188 字节 TS 包。
+ *
+ * 所以这里剥掉 RTP 头后交给 [TsDemuxer] 解复用，解出的 H.264 访问单元由
+ * [MiracastVideoRenderer] 直接送进 MediaCodec。
+ *
+ * 刻意不经过 ExoPlayer：播放器的缓冲策略对第二屏幕这种实时用途会引入 10 秒以上延迟，
+ * 而这条路径「收到即解码、解完即送显」，延迟只剩编码 + 传输 + 解码的固有开销。
+ *
+ * @param surfaceProvider 送显目标，应用切后台时返回 null
  */
 class RtpReceiver(
-    private val port: Int
+    private val port: Int,
+    surfaceProvider: () -> Surface?
 ) {
+
     private var socket: DatagramSocket? = null
-    private var isRunning = false
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    private var decoder: MediaCodec? = null
-    private var surface: Surface? = null
-
-    // RTP 包统计。UI（视频信息面板）会按秒轮询这些累计值做差分，故用 volatile 暴露只读属性。
     @Volatile
-    var packetsReceived = 0
+    private var isRunning = false
+
+    private val renderer = MiracastVideoRenderer(surfaceProvider)
+    private val demuxer = TsDemuxer(renderer::onAccessUnit, renderer::onDiscontinuity)
+
+    /**
+     * 接收线程与解码线程之间的缓冲。
+     *
+     * 不能在接收线程上直接解码：MediaCodec 一旦卡顿就会反压到 UDP 接收，内核缓冲区溢出
+     * 丢包，而丢包必然花屏。这里让接收线程只做「收包 + 入队」，保证它永远跑得飞快。
+     * 队列很浅（实时流不需要深队列），满了就丢最旧的并通知解码器等下一个关键帧。
+     */
+    private val payloadQueue = ArrayBlockingQueue<ByteArray>(256)
+
+    @Volatile
+    var packetsLost = 0L
+        private set
+
+    // 统计量，供视频信息面板做差分（累加即可，UI 侧换算速率）
+    @Volatile
+    var packetsReceived = 0L
         private set
 
     @Volatile
     var bytesReceived = 0L
         private set
 
-    /** 已送显的解码帧数，UI 据此换算实时帧率。 */
-    @Volatile
-    var framesDecoded = 0L
-        private set
-
-    /** 解码器实际使用的 MIME（Miracast 规范固定为 H.264）。 */
-    @Volatile
-    var videoCodec = ""
-        private set
-
-    // 解码器上报的实际画面尺寸（初始化时按 1920x1080 配置，实际值以输出格式为准）
-    @Volatile
-    var videoWidth = 0
-        private set
-
-    @Volatile
-    var videoHeight = 0
-        private set
-
-    // H.264 NAL 单元缓冲
-    private val nalBuffer = mutableListOf<ByteArray>()
-
-    var onVideoFrame: ((ByteArray) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
 
-    fun start(surface: Surface?) {
+    companion object {
+        /** 当前会话的接收器，供视频信息面板读取统计量。 */
+        @Volatile
+        var active: RtpReceiver? = null
+    }
+
+    fun start() {
         if (isRunning) {
             Timber.w("RTP Receiver already running")
             return
         }
 
-        this.surface = surface
-        initDecoder()
+        active = this
+
+        scope.launch { runDecoder() }
 
         scope.launch {
             try {
-                socket = DatagramSocket(port)
+                socket = DatagramSocket(port).apply {
+                    // 默认接收缓冲只有几十 KB，2.5Mbps 的流稍有调度延迟就会溢出丢包
+                    runCatching { receiveBufferSize = 1024 * 1024 }
+                }
                 isRunning = true
-                Timber.i("RTP Receiver started on port $port")
+                Timber.i("RTP Receiver listening on UDP $port (expecting MPEG-2 TS, PT=33), " +
+                    "recvBuf=${socket?.receiveBufferSize}")
 
-                val buffer = ByteArray(65536) // 64KB 缓冲区
+                val buffer = ByteArray(65536)
                 val packet = DatagramPacket(buffer, buffer.size)
+                var loggedFirst = false
+                var expectedSeq = -1
 
                 while (isRunning) {
                     try {
+                        packet.length = buffer.size    // receive() 会缩短 length，每次要复位
                         socket?.receive(packet)
-                        if (packet.length > 0) {
-                            val rtpData = packet.data.copyOfRange(0, packet.length)
-                            handleRtpPacket(rtpData)
-                            packetsReceived++
-                            bytesReceived += packet.length
+                        if (packet.length <= 0) continue
 
-                            if (packetsReceived % 100 == 0) {
-                                Timber.v("RTP Stats: $packetsReceived packets, ${bytesReceived / 1024}KB received")
-                            }
+                        packetsReceived++
+                        bytesReceived += packet.length
+
+                        val payloadOffset = rtpHeaderLength(packet.data, packet.length)
+                        if (payloadOffset <= 0 || payloadOffset >= packet.length) continue
+
+                        if (!loggedFirst) {
+                            loggedFirst = true
+                            val pt = packet.data[1].toInt() and 0x7F
+                            Timber.i("First RTP packet: ${packet.length}B payloadType=$pt " +
+                                "payload=${packet.length - payloadOffset}B")
+                        }
+
+                        // RTP 序号跳变 = 网络丢包，残缺的帧不能喂给解码器
+                        val seq = ((packet.data[2].toInt() and 0xFF) shl 8) or
+                            (packet.data[3].toInt() and 0xFF)
+                        if (expectedSeq >= 0 && seq != expectedSeq) {
+                            val lost = (seq - expectedSeq + 0x10000) and 0xFFFF
+                            packetsLost += lost
+                            Timber.w("RTP: lost $lost packets (seq $expectedSeq → $seq)")
+                            renderer.onDiscontinuity()
+                        }
+                        expectedSeq = (seq + 1) and 0xFFFF
+
+                        // 接收线程只入队，解复用和解码在另一条线程上做
+                        val payload = packet.data.copyOfRange(payloadOffset, packet.length)
+                        if (!payloadQueue.offer(payload)) {
+                            payloadQueue.poll()
+                            payloadQueue.offer(payload)
+                            renderer.onDiscontinuity()
+                        }
+
+                        if (packetsReceived % 1000L == 0L) {
+                            Timber.i("RTP stats: $packetsReceived packets, ${bytesReceived / 1024}KB, " +
+                                "lost=$packetsLost, queue=${payloadQueue.size}")
                         }
                     } catch (e: Exception) {
-                        if (isRunning) {
-                            Timber.e(e, "Error receiving RTP packet")
-                        }
+                        if (isRunning) Timber.e(e, "Error receiving RTP packet")
                     }
                 }
             } catch (e: Exception) {
                 Timber.e(e, "Failed to start RTP Receiver")
-                onError?.invoke("Failed to start RTP Receiver: ${e.message}")
+                onError?.invoke("RTP 接收启动失败: ${e.message}")
                 isRunning = false
             }
         }
     }
 
-    private fun handleRtpPacket(data: ByteArray) {
-        if (data.size < 12) {
-            Timber.w("Invalid RTP packet: too short")
-            return
-        }
-
-        try {
-            // 解析 RTP 头部
-            val version = (data[0].toInt() shr 6) and 0x03
-            val padding = (data[0].toInt() shr 5) and 0x01
-            val extension = (data[0].toInt() shr 4) and 0x01
-            val csrcCount = data[0].toInt() and 0x0F
-
-            val marker = (data[1].toInt() shr 7) and 0x01
-            val payloadType = data[1].toInt() and 0x7F
-
-            val sequenceNumber = ((data[2].toInt() and 0xFF) shl 8) or (data[3].toInt() and 0xFF)
-            val timestamp = ((data[4].toInt() and 0xFF) shl 24) or
-                    ((data[5].toInt() and 0xFF) shl 16) or
-                    ((data[6].toInt() and 0xFF) shl 8) or
-                    (data[7].toInt() and 0xFF)
-
-            // 计算 RTP 头部长度
-            var headerLength = 12 + (csrcCount * 4)
-
-            // 如果有扩展头
-            if (extension == 1 && data.size > headerLength + 4) {
-                val extLength = ((data[headerLength + 2].toInt() and 0xFF) shl 8) or
-                        (data[headerLength + 3].toInt() and 0xFF)
-                headerLength += 4 + (extLength * 4)
+    /** 解码线程：从队列取 TS 负载做解复用，解出的访问单元由 renderer 送进 MediaCodec。 */
+    private suspend fun runDecoder() {
+        while (scope.isActive) {
+            val payload = withContext(Dispatchers.IO) {
+                payloadQueue.poll(200, TimeUnit.MILLISECONDS)
+            } ?: continue
+            try {
+                demuxer.feed(payload, 0, payload.size)
+            } catch (e: Exception) {
+                Timber.e(e, "Error demuxing TS payload")
+                renderer.onDiscontinuity()
             }
-
-            if (data.size <= headerLength) {
-                return
-            }
-
-            // 提取 RTP 负载 (H.264 数据)
-            var payloadLength = data.size - headerLength
-
-            // 处理 padding
-            if (padding == 1 && payloadLength > 0) {
-                val paddingLength = data[data.size - 1].toInt() and 0xFF
-                payloadLength -= paddingLength
-            }
-
-            if (payloadLength <= 0) {
-                return
-            }
-
-            val payload = data.copyOfRange(headerLength, headerLength + payloadLength)
-
-            // 处理 H.264 负载
-            handleH264Payload(payload, marker == 1)
-
-        } catch (e: Exception) {
-            Timber.e(e, "Error handling RTP packet")
-        }
-    }
-
-    private fun handleH264Payload(payload: ByteArray, marker: Boolean) {
-        if (payload.isEmpty()) return
-
-        try {
-            // 检查 NAL 单元类型
-            val nalUnitType = payload[0].toInt() and 0x1F
-
-            when (nalUnitType) {
-                in 1..23 -> {
-                    // 单个 NAL 单元
-                    decodeNalUnit(payload)
-                }
-                24 -> {
-                    // STAP-A (单时间聚合包)
-                    handleStapA(payload)
-                }
-                28 -> {
-                    // FU-A (分片单元)
-                    handleFuA(payload, marker)
-                }
-                else -> {
-                    Timber.v("Unknown NAL unit type: $nalUnitType")
-                }
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "Error handling H.264 payload")
-        }
-    }
-
-    private fun handleStapA(payload: ByteArray) {
-        // STAP-A: 多个 NAL 单元打包在一起
-        var offset = 1 // 跳过 STAP-A 头
-
-        while (offset + 2 < payload.size) {
-            val nalSize = ((payload[offset].toInt() and 0xFF) shl 8) or
-                    (payload[offset + 1].toInt() and 0xFF)
-            offset += 2
-
-            if (offset + nalSize <= payload.size) {
-                val nalUnit = payload.copyOfRange(offset, offset + nalSize)
-                decodeNalUnit(nalUnit)
-                offset += nalSize
-            } else {
-                break
-            }
-        }
-    }
-
-    private fun handleFuA(payload: ByteArray, marker: Boolean) {
-        if (payload.size < 2) return
-
-        // FU-A 格式: FU indicator (1 byte) + FU header (1 byte) + FU payload
-        val fuIndicator = payload[0]
-        val fuHeader = payload[1]
-
-        val start = (fuHeader.toInt() shr 7) and 0x01
-        val end = (fuHeader.toInt() shr 6) and 0x01
-        val nalUnitType = fuHeader.toInt() and 0x1F
-
-        val fragmentData = payload.copyOfRange(2, payload.size)
-
-        if (start == 1) {
-            // 分片开始
-            nalBuffer.clear()
-            // 重建 NAL 头
-            val nalHeader = ((fuIndicator.toInt() and 0xE0) or nalUnitType).toByte()
-            nalBuffer.add(byteArrayOf(nalHeader))
-        }
-
-        nalBuffer.add(fragmentData)
-
-        if (end == 1 || marker) {
-            // 分片结束，组合完整的 NAL 单元
-            val completeNal = nalBuffer.flatMap { it.asIterable() }.toByteArray()
-            decodeNalUnit(completeNal)
-            nalBuffer.clear()
-        }
-    }
-
-    private fun decodeNalUnit(nalUnit: ByteArray) {
-        try {
-            val decoder = this.decoder ?: return
-
-            // 添加起始码 (0x00 0x00 0x00 0x01)
-            val nalWithStartCode = ByteArray(4 + nalUnit.size)
-            nalWithStartCode[0] = 0x00
-            nalWithStartCode[1] = 0x00
-            nalWithStartCode[2] = 0x00
-            nalWithStartCode[3] = 0x01
-            System.arraycopy(nalUnit, 0, nalWithStartCode, 4, nalUnit.size)
-
-            // 送入解码器
-            val inputBufferIndex = decoder.dequeueInputBuffer(10000)
-            if (inputBufferIndex >= 0) {
-                val inputBuffer = decoder.getInputBuffer(inputBufferIndex)
-                if (inputBuffer != null) {
-                    inputBuffer.clear()
-                    inputBuffer.put(nalWithStartCode)
-                    decoder.queueInputBuffer(
-                        inputBufferIndex,
-                        0,
-                        nalWithStartCode.size,
-                        System.nanoTime() / 1000,
-                        0
-                    )
-                }
-            }
-
-            // 获取输出
-            val bufferInfo = MediaCodec.BufferInfo()
-            var outputBufferIndex = decoder.dequeueOutputBuffer(bufferInfo, 0)
-
-            while (outputBufferIndex != MediaCodec.INFO_TRY_AGAIN_LATER) {
-                when {
-                    outputBufferIndex >= 0 -> {
-                        decoder.releaseOutputBuffer(outputBufferIndex, true)
-                        framesDecoded++
-                    }
-                    outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        // 解码器解析 SPS 后才知道真实分辨率
-                        readOutputSize(decoder.outputFormat)
-                        Timber.i("Miracast decoder output format: ${videoWidth}x$videoHeight")
-                    }
-                }
-                outputBufferIndex = decoder.dequeueOutputBuffer(bufferInfo, 0)
-            }
-
-        } catch (e: Exception) {
-            Timber.e(e, "Error decoding NAL unit")
         }
     }
 
     /**
-     * 读取解码器输出尺寸。优先用 crop 矩形（KEY_WIDTH/KEY_HEIGHT 常是对齐后的补齐尺寸，
-     * 例如 1080p 会报成 1088 高）。
+     * 计算 RTP 头长度：固定 12 字节 + CSRC 列表 + 可选扩展头。
+     * @return 负载起始偏移；包不合法时返回 -1
      */
-    private fun readOutputSize(format: MediaFormat) {
-        val hasCrop = format.containsKey("crop-left") && format.containsKey("crop-right") &&
-                format.containsKey("crop-top") && format.containsKey("crop-bottom")
-        if (hasCrop) {
-            videoWidth = format.getInteger("crop-right") - format.getInteger("crop-left") + 1
-            videoHeight = format.getInteger("crop-bottom") - format.getInteger("crop-top") + 1
-        } else {
-            videoWidth = format.getInteger(MediaFormat.KEY_WIDTH)
-            videoHeight = format.getInteger(MediaFormat.KEY_HEIGHT)
+    private fun rtpHeaderLength(data: ByteArray, length: Int): Int {
+        if (length < 12) return -1
+        val version = (data[0].toInt() shr 6) and 0x03
+        if (version != 2) return -1
+
+        val csrcCount = data[0].toInt() and 0x0F
+        val hasExtension = ((data[0].toInt() shr 4) and 0x01) == 1
+        var headerLength = 12 + csrcCount * 4
+
+        if (hasExtension) {
+            if (length < headerLength + 4) return -1
+            val extWords = ((data[headerLength + 2].toInt() and 0xFF) shl 8) or
+                (data[headerLength + 3].toInt() and 0xFF)
+            headerLength += 4 + extWords * 4
         }
-    }
-
-    private fun initDecoder() {
-        try {
-            // 创建 H.264 解码器
-            decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-
-            // 配置解码器
-            val format = MediaFormat.createVideoFormat(
-                MediaFormat.MIMETYPE_VIDEO_AVC,
-                1920, // 默认宽度
-                1080  // 默认高度
-            )
-
-            decoder?.configure(format, surface, null, 0)
-            decoder?.start()
-            videoCodec = MediaFormat.MIMETYPE_VIDEO_AVC
-
-            Timber.i("H.264 decoder initialized")
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to initialize H.264 decoder")
-            onError?.invoke("Failed to initialize decoder: ${e.message}")
-        }
+        return if (headerLength < length) headerLength else -1
     }
 
     fun stop() {
         isRunning = false
         scope.cancel()
-
-        try {
-            decoder?.stop()
-            decoder?.release()
-            decoder = null
-            Timber.i("H.264 decoder released")
-        } catch (e: Exception) {
-            Timber.e(e, "Error releasing decoder")
-        }
+        renderer.release()
+        demuxer.reset()
+        if (active === this) active = null
 
         try {
             socket?.close()
             socket = null
-            Timber.i("RTP Receiver stopped")
         } catch (e: Exception) {
-            Timber.e(e, "Error stopping RTP Receiver")
+            Timber.e(e, "Error closing RTP socket")
         }
-
-        Timber.i("RTP Stats: Total $packetsReceived packets, ${bytesReceived / 1024}KB received")
+        Timber.i("RTP Receiver stopped: $packetsReceived packets, ${bytesReceived / 1024}KB")
     }
 
-    fun getStats(): String {
-        return "Packets: $packetsReceived, Data: ${bytesReceived / 1024}KB"
-    }
+    fun isRunning(): Boolean = isRunning
 }

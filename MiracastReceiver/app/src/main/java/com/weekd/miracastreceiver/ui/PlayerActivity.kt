@@ -28,6 +28,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
@@ -78,7 +79,7 @@ class PlayerActivity : AppCompatActivity() {
         const val EXTRA_QUALITY_URI = "quality_uri"
 
         @Volatile
-        var airPlayMirrorSurface: Surface? = null
+        var mirrorSurface: Surface? = null
             private set
 
         private const val IMAGE_SLIDE_INTERVAL_MS = 5_000L
@@ -93,7 +94,7 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private lateinit var playerView: PlayerView
-    private lateinit var airPlayMirrorSurfaceView: SurfaceView
+    private lateinit var mirrorSurfaceView: SurfaceView
     private lateinit var imageView: ImageView
     private lateinit var tvStatus: TextView
     private lateinit var tvTitle: TextView
@@ -112,10 +113,9 @@ class PlayerActivity : AppCompatActivity() {
     private var slideJob: Job? = null
     private var progressUpdateJob: Job? = null
     private var qualityHeight: Int = QUALITY_AUTO
-    private var rtpReceiver: RtpReceiver? = null
     private var isMiracastSession = false
     private var isAirPlayMirrorSession = false
-    private var airPlayAspectJob: Job? = null
+    private var mirrorAspectJob: Job? = null
     private var currentSpeed = 1f
 
     // 视频流信息面板
@@ -189,7 +189,7 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun initViews() {
         playerView = findViewById(R.id.player_view)
-        airPlayMirrorSurfaceView = findViewById(R.id.airplay_mirror_surface)
+        mirrorSurfaceView = findViewById(R.id.airplay_mirror_surface)
         imageView = findViewById(R.id.image_view)
         tvStatus = findViewById(R.id.tv_status)
         tvTitle = findViewById(R.id.tv_title)
@@ -199,12 +199,41 @@ class PlayerActivity : AppCompatActivity() {
         bufferingIndicator = findViewById(R.id.buffering_indicator)
     }
 
-    private fun initPlayer() {
+    /**
+     * @param lowLatency 实时投屏（Miracast）用。默认的缓冲策略是为点播设计的
+     *   （起播要缓冲 2.5 秒、重缓冲后要 5 秒），而实时流的数据严格按实时速率到达，
+     *   永远攒不出那么多缓冲，会陷入「解几帧 → 缓冲耗尽 → 转圈」的循环。
+     */
+    private fun initPlayer(lowLatency: Boolean = false) {
+        player?.release()
+
+        // 默认不限制分辨率（对应画质菜单的「自动」）。原先默认 setMaxVideoSizeSd() 会把所有
+        // 播放压到标清，Miracast 的 1080p 视频轨会被直接排除，导致选不出轨道、
+        // loader 停止加载，最终报 "stuck buffering and not loading"。
         trackSelector = DefaultTrackSelector(this).apply {
-            setParameters(buildUponParameters().setMaxVideoSizeSd())
+            setParameters(buildUponParameters().clearVideoSizeConstraints())
         }
+
+        val loadControl = DefaultLoadControl.Builder()
+            .apply {
+                if (lowLatency) {
+                    // maxBufferMs 不能压太小：到达上限后 ExoPlayer 会停止读取数据源，
+                    // 而 RTP 仍按实时速率灌进管道，管道溢出丢数据就会把 TS 流打出空洞，
+                    // 解码器拿不到完整 PES 直接黑屏。留出足够余量让它持续排空管道。
+                    setBufferDurationsMs(
+                        /* minBufferMs = */ 1_000,
+                        /* maxBufferMs = */ 8_000,
+                        /* bufferForPlaybackMs = */ 500,
+                        /* bufferForPlaybackAfterRebufferMs = */ 1_000
+                    )
+                    setPrioritizeTimeOverSizeThresholds(true)
+                }
+            }
+            .build()
+
         player = ExoPlayer.Builder(this)
             .setTrackSelector(trackSelector!!)
+            .setLoadControl(loadControl)
             .build()
             .apply {
                 addListener(object : Player.Listener {
@@ -233,7 +262,13 @@ class PlayerActivity : AppCompatActivity() {
                     }
 
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
-                        tvStatus.text = if (isPlaying) getString(R.string.playing) else "已暂停"
+                        // 缓冲中 isPlaying 也是 false，此时别把 onPlaybackStateChanged
+                        // 刚写好的「正在缓冲...」覆盖成「已暂停」，那会让人以为是暂停了
+                        tvStatus.text = when {
+                            isPlaying -> getString(R.string.playing)
+                            playbackState == Player.STATE_READY -> "已暂停"
+                            else -> return
+                        }
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
@@ -449,7 +484,7 @@ class PlayerActivity : AppCompatActivity() {
         player?.pause()
         playerView.player = null
         playerView.visibility = View.GONE
-        airPlayMirrorSurfaceView.visibility = View.VISIBLE
+        mirrorSurfaceView.visibility = View.VISIBLE
         imageView.visibility = View.GONE
         tvTitle.text = "iPhone 屏幕镜像"
         tvStatus.text = "正在接收 iPhone 屏幕..."
@@ -457,34 +492,41 @@ class PlayerActivity : AppCompatActivity() {
         updateBufferingState(false)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 
-        val surfaceView = airPlayMirrorSurfaceView
-
-        fun publishSurface(holder: SurfaceHolder) {
-            val surface = holder.surface
-            airPlayMirrorSurface = surface.takeIf { it.isValid }
-            Timber.i("AirPlay mirror surface ${if (airPlayMirrorSurface == null) "not ready" else "ready"}")
-            if (airPlayMirrorSurface == null) {
-                tvStatus.text = "等待 AirPlay 显示画面..."
-            } else {
-                tvStatus.text = "正在接收 iPhone 屏幕..."
-            }
-        }
-
-        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) = publishSurface(holder)
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = publishSurface(holder)
-            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                Timber.i("AirPlay mirror surface destroyed")
-                airPlayMirrorSurface = null
-            }
-        })
-        playerView.post { publishSurface(surfaceView.holder) }
-        startAirPlayAspectFitUpdates()
+        publishMirrorSurface()
     }
 
-    private fun startAirPlayAspectFitUpdates() {
-        airPlayAspectJob?.cancel()
-        airPlayAspectJob = lifecycleScope.launch {
+    /**
+     * 把镜像 SurfaceView 的 Surface 发布给解码器。AirPlay 镜像和 Miracast 共用这一块
+     * Surface —— 两者都是「解码器直接送显」的实时镜像，不经过 ExoPlayer。
+     *
+     * 应用切后台时 SurfaceView 会销毁 Surface、回到前台再造一个新的，所以必须持续跟踪
+     * 变化并置空，否则解码器会往失效的 Surface 上写，画面一直黑。
+     */
+    private fun publishMirrorSurface() {
+        val waitingText = if (isMiracastSession) "等待 Windows 画面..." else "等待 AirPlay 显示画面..."
+        val activeText = if (isMiracastSession) "正在接收 Windows 屏幕..." else "正在接收 iPhone 屏幕..."
+
+        fun publish(holder: SurfaceHolder) {
+            mirrorSurface = holder.surface.takeIf { it.isValid }
+            Timber.i("Mirror surface ${if (mirrorSurface == null) "not ready" else "ready"}")
+            tvStatus.text = if (mirrorSurface == null) waitingText else activeText
+        }
+
+        mirrorSurfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) = publish(holder)
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = publish(holder)
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                Timber.i("Mirror surface destroyed")
+                mirrorSurface = null
+            }
+        })
+        mirrorSurfaceView.post { publish(mirrorSurfaceView.holder) }
+        startMirrorAspectFitUpdates()
+    }
+
+    private fun startMirrorAspectFitUpdates() {
+        mirrorAspectJob?.cancel()
+        mirrorAspectJob = lifecycleScope.launch {
             var lastW = 0
             var lastH = 0
             while (isActive) {
@@ -493,15 +535,15 @@ class PlayerActivity : AppCompatActivity() {
                 if (videoW > 0 && videoH > 0 && (videoW != lastW || videoH != lastH)) {
                     lastW = videoW
                     lastH = videoH
-                    fitAirPlaySurface(videoW, videoH)
+                    fitMirrorSurface(videoW, videoH)
                 }
                 delay(300)
             }
         }
     }
 
-    private fun fitAirPlaySurface(videoW: Int, videoH: Int) {
-        val parent = airPlayMirrorSurfaceView.parent as? View ?: return
+    private fun fitMirrorSurface(videoW: Int, videoH: Int) {
+        val parent = mirrorSurfaceView.parent as? View ?: return
         val parentW = parent.width
         val parentH = parent.height
         if (parentW <= 0 || parentH <= 0) return
@@ -514,49 +556,41 @@ class PlayerActivity : AppCompatActivity() {
             (parentH * videoAspect).toInt() to parentH
         }
 
-        airPlayMirrorSurfaceView.layoutParams = airPlayMirrorSurfaceView.layoutParams.apply {
+        mirrorSurfaceView.layoutParams = mirrorSurfaceView.layoutParams.apply {
             width = targetW.coerceAtLeast(1)
             height = targetH.coerceAtLeast(1)
         }
         Timber.i("AirPlay mirror aspect-fit: video=${videoW}x$videoH view=${targetW}x$targetH parent=${parentW}x$parentH")
     }
 
+    /**
+     * Miracast 显示。RTP 接收、TS 解复用和解码都由
+     * [com.weekd.miracastreceiver.miracast.WfdServer] 那条链路完成，这里只负责把镜像
+     * Surface 交出去 —— 和 AirPlay 镜像完全同一套机制。
+     *
+     * 刻意不经过 ExoPlayer：播放器的缓冲和时钟同步会引入秒级延迟（实测超过 10 秒），
+     * 而第二屏幕这种用途要的是「收到即解码、解完即送显」。
+     */
     private fun startMiracastPlayback(rtpPort: Int, sessionId: String?) {
-        if (rtpPort <= 0) {
-            tvStatus.text = "Miracast 连接错误"
-            tvError.text = "无效的 RTP 端口"
-            tvError.visibility = View.VISIBLE
-            return
-        }
-
-        Timber.i("Starting Miracast playback: port=$rtpPort session=$sessionId")
+        Timber.i("Starting Miracast display: rtpPort=$rtpPort session=$sessionId")
         isMiracastSession = true
         isAirPlayMirrorSession = false
         streamInfoTracker.reset()
         stopImageSlideShow()
+
+        player?.clearVideoSurface()
         player?.pause()
-        playerView.visibility = View.VISIBLE
+        playerView.player = null
+        playerView.visibility = View.GONE
         imageView.visibility = View.GONE
+        mirrorSurfaceView.visibility = View.VISIBLE
         tvTitle.text = "Windows 无线显示器"
         tvStatus.text = "正在接收 Windows 屏幕..."
         tvError.visibility = View.GONE
         updateBufferingState(false)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 
-        playerView.post {
-            val surface = (playerView.videoSurfaceView as? SurfaceView)?.holder?.surface
-            rtpReceiver?.stop()
-            rtpReceiver = RtpReceiver(rtpPort).apply {
-                onError = { message ->
-                    runOnUiThread {
-                        tvStatus.text = "Miracast 播放错误"
-                        tvError.text = message
-                        tvError.visibility = View.VISIBLE
-                    }
-                }
-                start(surface)
-            }
-        }
+        publishMirrorSurface()
     }
 
     private fun playMedia(uri: String) {
@@ -761,14 +795,17 @@ class PlayerActivity : AppCompatActivity() {
         )
     }
 
-    /** Miracast：全部数据来自 RtpReceiver 的累计计数。 */
+    /**
+     * Miracast：不经过 ExoPlayer，所以分辨率取解码器上报的值（[StreamStats]，由
+     * VideoDecoder 写入），码率和网速取 [RtpReceiver] 的累计字节数。
+     * 帧率暂不统计 —— 解码路径上没有帧计数器。
+     */
     private fun buildMiracastStreamInfo(): String {
-        val receiver = rtpReceiver
-        val sample = streamInfoTracker.sample(receiver?.bytesReceived ?: 0L, receiver?.framesDecoded ?: 0L)
+        val sample = streamInfoTracker.sample(RtpReceiver.active?.bytesReceived ?: 0L, 0L)
         return streamInfoLines(
-            resolution = StreamInfoTracker.formatResolution(receiver?.videoWidth ?: 0, receiver?.videoHeight ?: 0),
-            codec = StreamInfoTracker.formatCodec(receiver?.videoCodec),
-            fps = StreamInfoTracker.formatFps(sample.fps.toFloat()),
+            resolution = StreamInfoTracker.formatResolution(StreamStats.videoWidth, StreamStats.videoHeight),
+            codec = StreamInfoTracker.formatCodec("video/avc"),
+            fps = StreamInfoTracker.formatFps(0f),
             bitrate = StreamInfoTracker.formatBitrate(sample.bitrateBps),
             speed = StreamInfoTracker.formatSpeed(sample.bytesPerSec)
         )
@@ -798,10 +835,10 @@ class PlayerActivity : AppCompatActivity() {
     /**
      * 画面实际渲染到屏幕上的像素尺寸。
      * PlayerView 会按比例把内容框缩到片源宽高比，所以这里拿到的是去掉黑边后的真实显示尺寸；
-     * 镜像模式则读 [fitAirPlaySurface] 调整过的镜像 Surface。视图还没测量时退回屏幕分辨率。
+     * 镜像模式则读 [fitMirrorSurface] 调整过的镜像 Surface。视图还没测量时退回屏幕分辨率。
      */
     private fun currentDisplaySize(): Pair<Int, Int> {
-        val renderView = if (isAirPlayMirrorSession) airPlayMirrorSurfaceView else playerView.videoSurfaceView
+        val renderView = if (isAirPlayMirrorSession) mirrorSurfaceView else playerView.videoSurfaceView
         val width = renderView?.width ?: 0
         val height = renderView?.height ?: 0
         if (width > 0 && height > 0) return width to height
@@ -909,8 +946,8 @@ class PlayerActivity : AppCompatActivity() {
     private fun stopPlayback() {
         stopImageSlideShow()
         stopProgressUpdates()
-        airPlayAspectJob?.cancel()
-        airPlayAspectJob = null
+        mirrorAspectJob?.cancel()
+        mirrorAspectJob = null
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         player?.stop()
         reportPlaybackStopped()
@@ -965,14 +1002,13 @@ class PlayerActivity : AppCompatActivity() {
             Timber.e(e, "Error unregistering receiver")
         }
         stopImageSlideShow()
-        airPlayAspectJob?.cancel()
-        airPlayAspectJob = null
+        mirrorAspectJob?.cancel()
+        mirrorAspectJob = null
         streamInfoJob?.cancel()
         streamInfoJob = null
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        rtpReceiver?.stop()
-        rtpReceiver = null
-        airPlayMirrorSurface = null
+        // RTP 接收器归 WfdServer 所有（会话结束时由它停止），这里不要碰
+        mirrorSurface = null
         player?.release()
         player = null
         reportPlaybackStopped()

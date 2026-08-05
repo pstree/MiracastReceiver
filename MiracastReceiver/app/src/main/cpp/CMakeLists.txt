@@ -34,3 +34,13 @@ target_compile_options(alac PRIVATE -w)
 # __android_log_print for native error logging.
 find_library(log-lib log)
 target_link_libraries(alac ${log-lib})
+
+# wpa_supplicant 控制接口客户端，用于注入 Wi-Fi Display Sink 的 WFD IE
+# （应用层 setWFDInfo 需要 signature 级权限，必定失败，只能靠 root 走这条路）。
+#
+# 这是可执行文件而非库，但刻意命名成 libwfdctl.so —— 只有这个命名才会被 AGP
+# 打进 APK 的 jniLibs，解压到 nativeLibraryDir 并带上可执行权限，从而能用 su 拉起。
+add_executable(wfdctl wfdctl.c)
+set_target_properties(wfdctl PROPERTIES
+    PREFIX "lib"
+    OUTPUT_NAME "wfdctl.so")

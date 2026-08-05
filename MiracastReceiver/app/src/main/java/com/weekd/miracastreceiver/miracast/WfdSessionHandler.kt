@@ -3,307 +3,277 @@ package com.weekd.miracastreceiver.miracast
 import android.content.Context
 import android.content.Intent
 import timber.log.Timber
-import java.io.*
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.Socket
 import java.nio.charset.StandardCharsets
 
 /**
- * Wi-Fi Display RTSP 会话处理器
- * 处理 RTSP 请求和响应
+ * Wi-Fi Display RTSP 会话处理器（Sink 侧）。
+ *
+ * 重要：WFD 里 **Source 才是 RTSP 监听方**，Sink 必须主动连到 Source 的 7236 端口。
+ * 这一点已对 Windows 11 的 MSMiracastSource 实测确认。连接建立后，双方在同一条 TCP 上
+ * 互为客户端和服务端：
+ *
+ * ```
+ * M1  Source → Sink   OPTIONS         本类回 200 + Public
+ * M2  Sink   → Source OPTIONS         本类主动发
+ * M3  Source → Sink   GET_PARAMETER   本类回能力集（必须含 wfd_client_rtp_ports）
+ * M4  Source → Sink   SET_PARAMETER   选定格式 + presentation URL
+ * M5  Source → Sink   SET_PARAMETER   wfd_trigger_method: SETUP
+ * M6  Sink   → Source SETUP           本类主动发，带 client_port
+ * M7  Sink   → Source PLAY            本类主动发，之后 RTP 开始流入
+ * ```
+ *
+ * @param socket 已连接到 Source 的 TCP 连接
+ * @param rtpPort 本机用于接收 RTP 的 UDP 端口，会在 M3 和 M6 里告知 Source
  */
 class WfdSessionHandler(
     private val context: Context,
-    private val socket: Socket
+    private val socket: Socket,
+    private val rtpPort: Int
 ) {
-    private val input = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
-    private val output = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))
+    private val input: InputStream = socket.getInputStream()
+    private val output: OutputStream = socket.getOutputStream()
 
-    private var cseq = 0
-    private var sessionId: String = generateSessionId()
-    private var rtpPort: Int = 0
+    private var outCseq = 0                  // 我们主动发起的请求用的 CSeq
+    private var sessionId = ""
+    private var presentationUrl = ""
+    private var playRequested = false
 
-    // WFD 参数
-    private val wfdVideoFormats = "00 00 02 02 00000040 00000000 00000000 00 0000 0000 00 none none"
-    private val wfdAudioFormats = "LPCM 00000003 00, AAC 00000001 00"
-    private val wfdContentProtection = "none"
-    private val wfd3dVideoFormats = "none"
-    private val wfdCoupledSink = "none"
-    private val wfdDisplayEdid = "none"
-
-    // 回调接口
-    var onConnectionRequest: ((clientName: String, clientAddress: String) -> Unit)? = null
-    var onConnectionEstablish: ((sessionId: String) -> Unit)? = null
+    var onSessionEstablished: ((sessionId: String) -> Unit)? = null
     var onStreamStart: ((rtpPort: Int) -> Unit)? = null
     var onStreamStop: (() -> Unit)? = null
 
-    suspend fun handleSession() {
+    companion object {
+        /**
+         * 本机作为 Sink 声明的能力集。字段依次为：
+         * native / preferred-display-mode / profile / level / CEA / VESA / HH /
+         * latency / min-slice-size / slice-enc-params / frame-rate-control / max-hres / max-vres
+         *
+         * CEA 位图只声明三档，Windows 实测会挑其中最高的一档：
+         * ```
+         * bit 8 (0x100) = 1920x1080p60   ← 目标：帧间隔 16ms
+         * bit 7 (0x080) = 1920x1080p30      链路撑不住时的退路
+         * bit 6 (0x040) = 1280x720p60       再退一档
+         * ```
+         * 之前用的 0x0001DEFF 看着覆盖很广，但**恰好没有 bit 8**，所以 Windows 只能选到
+         * 1080p30，帧间隔 33ms —— 而视频 PES 不定长，必须等下一帧首包才知道当前帧结束，
+         * 这个等待直接等于帧间隔，是延迟的大头。
+         *
+         * level 同步提到 0x10（H.264 Level 4.2）：1080p60 超出了 Level 4.0 的上限。
+         */
+        private const val VIDEO_FORMATS =
+            "00 00 02 10 000001C0 00000000 00000000 00 0000 0000 00 none none"
+        private const val AUDIO_CODECS = "AAC 00000001 00"
+    }
+
+    fun handleSession() {
         try {
-            while (socket.isConnected && !socket.isClosed) {
-                val request = readRtspRequest() ?: break
-                handleRtspRequest(request)
+            Timber.i("WFD session started with source ${socket.inetAddress.hostAddress}")
+            while (!socket.isClosed) {
+                val msg = readMessage() ?: break
+                if (msg.startsWith("RTSP/1.0")) handleResponse(msg) else handleRequest(msg)
             }
         } catch (e: Exception) {
             Timber.e(e, "Error in WFD session")
         } finally {
+            Timber.i("WFD session ended")
+            onStreamStop?.invoke()
             close()
         }
     }
 
-    private fun readRtspRequest(): RtspRequest? {
-        try {
-            val requestLine = input.readLine() ?: return null
-            if (requestLine.isEmpty()) return null
+    // ─── 读取一条完整 RTSP 消息（头部 + 按 Content-Length 读 body）────────────
+    private fun readMessage(): String? {
+        val buf = StringBuilder()
+        val one = ByteArray(1)
 
-            val parts = requestLine.split(" ")
-            if (parts.size < 3) return null
-
-            val method = parts[0]
-            val uri = parts[1]
-            val version = parts[2]
-
-            val headers = mutableMapOf<String, String>()
-            var line = input.readLine()
-            while (line != null && line.isNotEmpty()) {
-                val colonIndex = line.indexOf(':')
-                if (colonIndex > 0) {
-                    val key = line.substring(0, colonIndex).trim()
-                    val value = line.substring(colonIndex + 1).trim()
-                    headers[key] = value
-                }
-                line = input.readLine()
-            }
-
-            // 读取消息体
-            var body: String? = null
-            val contentLength = headers["Content-Length"]?.toIntOrNull() ?: 0
-            if (contentLength > 0) {
-                val buffer = CharArray(contentLength)
-                input.read(buffer, 0, contentLength)
-                body = String(buffer)
-            }
-
-            cseq = headers["CSeq"]?.toIntOrNull() ?: 0
-
-            Timber.d("RTSP Request: $method $uri")
-
-            return RtspRequest(method, uri, version, headers, body)
-        } catch (e: Exception) {
-            Timber.e(e, "Error reading RTSP request")
-            return null
-        }
-    }
-
-    private fun handleRtspRequest(request: RtspRequest) {
-        when (request.method) {
-            "OPTIONS" -> handleOptions(request)
-            "GET_PARAMETER" -> handleGetParameter(request)
-            "SET_PARAMETER" -> handleSetParameter(request)
-            "SETUP" -> handleSetup(request)
-            "PLAY" -> handlePlay(request)
-            "PAUSE" -> handlePause(request)
-            "TEARDOWN" -> handleTeardown(request)
-            else -> sendResponse(501, "Not Implemented")
-        }
-    }
-
-    private fun handleOptions(request: RtspRequest) {
-        val response = buildResponse(200, "OK") {
-            append("Public: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, TEARDOWN, PAUSE\r\n")
-        }
-        sendRawResponse(response)
-    }
-
-    private fun handleGetParameter(request: RtspRequest) {
-        val body = request.body
-        if (body.isNullOrEmpty()) {
-            // Keep-alive
-            sendResponse(200, "OK")
-            return
-        }
-
-        val responseBody = StringBuilder()
-
-        body.lines().forEach { param ->
-            val paramName = param.trim()
-            when (paramName) {
-                "wfd_video_formats" -> responseBody.append("wfd_video_formats: $wfdVideoFormats\r\n")
-                "wfd_audio_codecs" -> responseBody.append("wfd_audio_codecs: $wfdAudioFormats\r\n")
-                "wfd_content_protection" -> responseBody.append("wfd_content_protection: $wfdContentProtection\r\n")
-                "wfd_3d_video_formats" -> responseBody.append("wfd_3d_video_formats: $wfd3dVideoFormats\r\n")
-                "wfd_coupled_sink" -> responseBody.append("wfd_coupled_sink: $wfdCoupledSink\r\n")
-                "wfd_display_edid" -> responseBody.append("wfd_display_edid: $wfdDisplayEdid\r\n")
-                "wfd_client_rtp_ports" -> {
-                    // 客户端提供的 RTP 端口
-                }
+        // 读到头部结束
+        while (!buf.endsWith("\r\n\r\n")) {
+            val n = input.read(one)
+            if (n <= 0) return null
+            buf.append(one[0].toInt().toChar())
+            if (buf.length > 64 * 1024) {
+                Timber.w("WFD: header too large, dropping session")
+                return null
             }
         }
 
-        val response = buildResponse(200, "OK", responseBody.toString())
-        sendRawResponse(response)
+        // 按 Content-Length 读 body（不能用 readLine，长度不足会静默截断）
+        val contentLength = Regex("(?i)Content-Length:\\s*(\\d+)")
+            .find(buf)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        if (contentLength > 0) {
+            val body = ByteArray(contentLength)
+            var read = 0
+            while (read < contentLength) {
+                val n = input.read(body, read, contentLength - read)
+                if (n <= 0) return null
+                read += n
+            }
+            buf.append(String(body, StandardCharsets.UTF_8))
+        }
+
+        val msg = buf.toString()
+        Timber.d("WFD >> ${msg.lineSequence().first()}")
+        Timber.v("WFD >> full:\n$msg")
+        return msg
     }
 
-    private fun handleSetParameter(request: RtspRequest) {
-        val body = request.body ?: ""
+    private fun send(msg: String) {
+        Timber.d("WFD << ${msg.lineSequence().first()}")
+        Timber.v("WFD << full:\n$msg")
+        output.write(msg.toByteArray(StandardCharsets.UTF_8))
+        output.flush()
+    }
 
-        // 解析 WFD 参数
-        body.lines().forEach { line ->
-            when {
-                line.startsWith("wfd_trigger_method:") -> {
-                    val trigger = line.substringAfter(":").trim()
-                    if (trigger == "SETUP") {
-                        Timber.i("WFD: Trigger SETUP received")
-                        val clientAddr = socket.inetAddress.hostAddress ?: "Unknown"
-                        onConnectionRequest?.invoke("Windows PC", clientAddr)
+    // ─── 处理 Source 发来的请求 ──────────────────────────────────────────────
+    private fun handleRequest(msg: String) {
+        val method = msg.substringBefore(' ')
+        val cseq = header(msg, "CSeq") ?: "0"
+
+        when (method) {
+            "OPTIONS" -> {
+                sendOk(cseq, "Public: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER\r\n")
+                sendOptions()                                    // M2
+            }
+            "GET_PARAMETER" -> {
+                if (msg.contains("wfd_")) sendCapabilities(cseq)  // M3
+                else sendOk(cseq)                                 // keep-alive
+            }
+            "SET_PARAMETER" -> {
+                // M4 里的 presentation URL 有两个值（"<url> none"），只能取第一个，
+                // 否则拼出的 SETUP 请求行会多一段，Source 判定畸形直接断链。
+                param(msg, "wfd_presentation_URL")
+                    ?.substringBefore(' ')
+                    ?.takeIf { it.startsWith("rtsp://") }
+                    ?.let {
+                        presentationUrl = it
+                        Timber.i("WFD: presentation URL = $it")
                     }
+                // M4 里 Source 回选的格式，第 5 个字段就是它选中的 CEA 分辨率位
+                param(msg, "wfd_video_formats")?.let { selected ->
+                    Timber.i("WFD: source selected video format = $selected")
+                    val ceaBit = selected.split(' ').getOrNull(4)?.toLongOrNull(16) ?: 0L
+                    val mode = when (ceaBit) {
+                        0x100L -> "1920x1080p60"
+                        0x080L -> "1920x1080p30"
+                        0x040L -> "1280x720p60"
+                        0x020L -> "1280x720p30"
+                        else -> "CEA 0x%08X".format(ceaBit)
+                    }
+                    Timber.i("WFD: negotiated mode = $mode")
                 }
-                line.startsWith("wfd_presentation_URL:") -> {
-                    val urls = line.substringAfter(":").trim()
-                    Timber.i("WFD: Presentation URLs: $urls")
-                }
-                line.startsWith("wfd_client_rtp_ports:") -> {
-                    val ports = line.substringAfter(":").trim()
-                    // 解析格式: RTP/AVP/UDP;unicast 1028 0 mode=play
-                    val portMatch = Regex("(\\d+)").find(ports)
-                    rtpPort = portMatch?.value?.toIntOrNull() ?: 0
-                    Timber.i("WFD: Client RTP port: $rtpPort")
-                }
+                sendOk(cseq)
+                if (msg.contains("wfd_trigger_method: SETUP")) sendSetup()      // M5 → M6
+                if (msg.contains("wfd_trigger_method: TEARDOWN")) close()
             }
+            "TEARDOWN" -> {
+                sendOk(cseq)
+                onStreamStop?.invoke()
+                close()
+            }
+            else -> sendOk(cseq)
         }
-
-        sendResponse(200, "OK")
     }
 
-    private fun handleSetup(request: RtspRequest) {
-        // 提取 Transport 信息
-        val transport = request.headers["Transport"] ?: ""
-        Timber.i("WFD SETUP: Transport=$transport")
-
-        // 响应 Transport
-        val responseTransport = "$transport;server_port=$rtpPort"
-
-        val response = buildResponse(200, "OK") {
-            append("Transport: $responseTransport\r\n")
-            append("Session: $sessionId\r\n")
+    // ─── 处理 Source 对我们请求的响应 ────────────────────────────────────────
+    private fun handleResponse(msg: String) {
+        val session = header(msg, "Session")?.substringBefore(';')
+        if (!session.isNullOrBlank() && sessionId.isEmpty()) {
+            sessionId = session
+            Timber.i("WFD: session id = $sessionId")
+            onSessionEstablished?.invoke(sessionId)
+            sendPlay()                                           // M7
+        } else if (playRequested) {
+            Timber.i("WFD: PLAY acknowledged, RTP should start on $rtpPort")
+            onStreamStart?.invoke(rtpPort)
+            startPlayerActivity()
+            playRequested = false
         }
-        sendRawResponse(response)
-
-        onConnectionEstablish?.invoke(sessionId)
     }
 
-    private fun handlePlay(request: RtspRequest) {
-        Timber.i("WFD PLAY: Starting stream")
+    // ─── 我们主动发起的请求 ──────────────────────────────────────────────────
+    private fun sendOptions() = send(
+        "OPTIONS * RTSP/1.0\r\n" +
+            "CSeq: ${++outCseq}\r\n" +
+            "Require: org.wfa.wfd1.0\r\n\r\n"
+    )
 
-        val response = buildResponse(200, "OK") {
-            append("Session: $sessionId\r\n")
+    private fun sendSetup() {
+        if (presentationUrl.isEmpty()) {
+            presentationUrl = "rtsp://${socket.inetAddress.hostAddress}/wfd1.0/streamid=0"
         }
-        sendRawResponse(response)
-
-        // 启动播放器接收 RTP 流
-        onStreamStart?.invoke(rtpPort)
-        startPlayerActivity()
+        send(
+            "SETUP $presentationUrl RTSP/1.0\r\n" +
+                "CSeq: ${++outCseq}\r\n" +
+                "Transport: RTP/AVP/UDP;unicast;client_port=$rtpPort\r\n\r\n"
+        )
     }
 
-    private fun handlePause(request: RtspRequest) {
-        Timber.i("WFD PAUSE: Pausing stream")
+    private fun sendPlay() {
+        playRequested = true
+        send(
+            "PLAY $presentationUrl RTSP/1.0\r\n" +
+                "CSeq: ${++outCseq}\r\n" +
+                "Session: $sessionId\r\n\r\n"
+        )
+    }
 
-        val response = buildResponse(200, "OK") {
-            append("Session: $sessionId\r\n")
+    // ─── 响应构造 ───────────────────────────────────────────────────────────
+    private fun sendOk(cseq: String, extraHeaders: String = "") =
+        send("RTSP/1.0 200 OK\r\nCSeq: $cseq\r\n$extraHeaders\r\n")
+
+    /**
+     * M3 能力响应：Source 问什么答什么，不认识的参数直接不答。
+     * 实测 Windows 会问 27 项（含 wfd2_* / intel_* / microsoft_* 私有扩展），
+     * 只回下面这几项标准参数它照样接受并推进到 M4。
+     */
+    private fun sendCapabilities(cseq: String) {
+        val body = buildString {
+            append("wfd_video_formats: $VIDEO_FORMATS\r\n")
+            append("wfd_audio_codecs: $AUDIO_CODECS\r\n")
+            // 关键：告诉 Source 往哪个 UDP 端口发 RTP，缺了这项收不到画面
+            append("wfd_client_rtp_ports: RTP/AVP/UDP;unicast $rtpPort 0 mode=play\r\n")
+            append("wfd_content_protection: none\r\n")
+            append("wfd_display_edid: none\r\n")
+            append("wfd_uibc_capability: none\r\n")
+            append("wfd_connector_type: 05\r\n")
         }
-        sendRawResponse(response)
-
-        // 发送暂停广播
-        sendPlayerBroadcast("PAUSE")
+        val bytes = body.toByteArray(StandardCharsets.UTF_8)
+        send(
+            "RTSP/1.0 200 OK\r\n" +
+                "CSeq: $cseq\r\n" +
+                "Content-Type: text/parameters\r\n" +
+                "Content-Length: ${bytes.size}\r\n\r\n" +
+                body
+        )
     }
 
-    private fun handleTeardown(request: RtspRequest) {
-        Timber.i("WFD TEARDOWN: Stopping stream")
+    // ─── 解析辅助 ───────────────────────────────────────────────────────────
+    private fun header(msg: String, name: String): String? =
+        Regex("(?i)^$name:\\s*(.+)$", RegexOption.MULTILINE)
+            .find(msg)?.groupValues?.get(1)?.trim()
 
-        sendResponse(200, "OK")
-
-        onStreamStop?.invoke()
-        sendPlayerBroadcast("STOP")
-        close()
-    }
+    private fun param(msg: String, name: String): String? =
+        Regex("(?i)^$name:\\s*(.+)$", RegexOption.MULTILINE)
+            .find(msg)?.groupValues?.get(1)?.trim()
 
     private fun startPlayerActivity() {
         val intent = Intent(context, com.weekd.miracastreceiver.ui.PlayerActivity::class.java).apply {
-            putExtra("SOURCE_TYPE", "MIRACAST")
-            putExtra("RTP_PORT", rtpPort)
-            putExtra("SESSION_ID", sessionId)
+            putExtra(com.weekd.miracastreceiver.ui.PlayerActivity.EXTRA_SOURCE_TYPE, "MIRACAST")
+            putExtra(com.weekd.miracastreceiver.ui.PlayerActivity.EXTRA_RTP_PORT, rtpPort)
+            putExtra(com.weekd.miracastreceiver.ui.PlayerActivity.EXTRA_SESSION_ID, sessionId)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         context.startActivity(intent)
     }
 
-    private fun sendPlayerBroadcast(action: String) {
-        val broadcastAction = when (action) {
-            "PLAY" -> com.weekd.miracastreceiver.ui.PlayerActivity.ACTION_PLAY
-            "PAUSE" -> com.weekd.miracastreceiver.ui.PlayerActivity.ACTION_PAUSE
-            "STOP" -> com.weekd.miracastreceiver.ui.PlayerActivity.ACTION_STOP
-            else -> return
-        }
-
-        val intent = Intent(broadcastAction).apply {
-            setPackage(context.packageName)
-        }
-        context.sendBroadcast(intent)
-    }
-
-    private fun buildResponse(statusCode: Int, statusText: String, body: String? = null, extraHeaders: (StringBuilder.() -> Unit)? = null): String {
-        val response = StringBuilder()
-        response.append("RTSP/1.0 $statusCode $statusText\r\n")
-        response.append("CSeq: $cseq\r\n")
-
-        extraHeaders?.invoke(response)
-
-        if (body != null) {
-            val bodyBytes = body.toByteArray(StandardCharsets.UTF_8)
-            response.append("Content-Type: text/parameters\r\n")
-            response.append("Content-Length: ${bodyBytes.size}\r\n")
-            response.append("\r\n")
-            response.append(body)
-        } else {
-            response.append("\r\n")
-        }
-
-        return response.toString()
-    }
-
-    private fun sendResponse(statusCode: Int, statusText: String) {
-        val response = buildResponse(statusCode, statusText)
-        sendRawResponse(response)
-    }
-
-    private fun sendRawResponse(response: String) {
-        try {
-            output.write(response)
-            output.flush()
-            Timber.v("RTSP Response sent: ${response.lines().first()}")
-        } catch (e: Exception) {
-            Timber.e(e, "Error sending RTSP response")
-        }
-    }
-
     fun close() {
         try {
-            input.close()
-            output.close()
             socket.close()
-            Timber.d("WFD session closed")
         } catch (e: Exception) {
-            Timber.e(e, "Error closing WFD session")
+            Timber.e(e, "Error closing WFD session socket")
         }
     }
-
-    private fun generateSessionId(): String {
-        return System.currentTimeMillis().toString(36)
-    }
-
-    data class RtspRequest(
-        val method: String,
-        val uri: String,
-        val version: String,
-        val headers: Map<String, String>,
-        val body: String?
-    )
 }

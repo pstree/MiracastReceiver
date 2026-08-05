@@ -17,8 +17,14 @@ import timber.log.Timber
  * Wi-Fi Direct (P2P) 管理器
  * 用于 Miracast/WFD 设备发现
  */
+/**
+ * @param deviceName 对外显示的 P2P 设备名。Windows 的「无线显示器」列表里显示的就是它，
+ *   所以必须和 AirPlay / DLNA 用同一个名字（[com.weekd.miracastreceiver.discovery.DeviceInfoProvider]），
+ *   否则同一台设备在不同投屏方式下会显示成不同名称。
+ */
 class WifiDirectManager(
-    private val context: Context
+    private val context: Context,
+    private val deviceName: String
 ) {
     private val manager: WifiP2pManager by lazy {
         context.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
@@ -145,7 +151,7 @@ class WifiDirectManager(
                             onGroupCreated?.invoke(group)
 
                             // 设置设备名称
-                            setDeviceName("Miracast-TV")
+                            setDeviceName(deviceName)
                         }
                     }
                 }

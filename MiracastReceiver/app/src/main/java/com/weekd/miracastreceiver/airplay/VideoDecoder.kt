@@ -88,10 +88,10 @@ class VideoDecoder(private val outputSurface: Surface) {
             return
         }
 
-        // Try to extract actual resolution from the SPS NAL unit. The parser can misread some senders'
-        // SPS (e.g. iPhone) and return nonsense like 32x87392 — configuring MediaCodec with that wedges
-        // the decoder (no input buffers, no frames). Validate the result and fall back to the hint; the
-        // hardware decoder reads the true size from the SPS (csd-0) itself and reports it via
+        // Try to extract actual resolution from the SPS NAL unit. Keep validating the result and
+        // falling back to the hint: a malformed SPS can still yield nonsense, and configuring
+        // MediaCodec with that wedges the decoder (no input buffers, no frames). The hardware
+        // decoder reads the true size from the SPS (csd-0) itself and reports it via
         // INFO_OUTPUT_FORMAT_CHANGED, which we use to refine the size for aspect-fit.
         val parsed = Companion.parseSpsResolution(spsBytes)
         val (actualWidth, actualHeight) = parsed?.takeIf { isPlausibleSize(it.first, it.second) } ?: run {
@@ -336,7 +336,23 @@ class VideoDecoder(private val outputSurface: Surface) {
         internal fun parseSpsResolution(sps: ByteArray): Pair<Int, Int>? {
             try {
                 if (sps.size < 4) return null
-                val reader = SpsBitReader(sps, startOffset = 1)  // skip NAL type byte (0x67)
+
+                // 所有调用方传进来的 SPS 都带 Annex B 起始码（MirrorStreamServer 传 sc+sps，
+                // MiracastVideoRenderer 从码流里抓的也带），必须先跳过起始码再跳过 NAL 头字节。
+                //
+                // 原先固定 startOffset=1，等于只跳过了起始码的第一个 0x00，之后按位读到的
+                // 全是错位数据 —— 上面那句「某些发送端的 SPS 会被误读」其实对所有发送端都成立。
+                // Miracast 实测把 1920x1080 解成 190x140，而这个值恰好通过了合法性检查，
+                // 于是解码器就按 190x140 去配置解码 1080p 的流。
+                val nalStart = when {
+                    sps.size >= 4 && sps[0].toInt() == 0 && sps[1].toInt() == 0 &&
+                        sps[2].toInt() == 0 && sps[3].toInt() == 1 -> 4
+                    sps[0].toInt() == 0 && sps[1].toInt() == 0 && sps[2].toInt() == 1 -> 3
+                    else -> 0     // 没有起始码，首字节就是 NAL 头
+                }
+                if (nalStart + 1 >= sps.size) return null
+
+                val reader = SpsBitReader(sps, startOffset = nalStart + 1)  // 跳过 NAL 头字节（0x67）
 
                 val profileIdc = reader.readBits(8)
                 reader.readBits(8)   // constraint flags + 2 reserved zeros

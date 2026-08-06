@@ -47,7 +47,11 @@ class MainActivity : AppCompatActivity() {
             get() = if (Build.VERSION.SDK_INT >= 33) {
                 arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
             } else {
-                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                // Android 12+ 只申请 FINE 会被系统直接拒绝，必须两个一起申请
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
             }
     }
 

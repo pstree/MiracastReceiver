@@ -1,6 +1,7 @@
 package com.weekd.miracastreceiver.utils
 
 import android.content.Context
+import android.os.Build
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
@@ -14,25 +15,41 @@ import java.net.NetworkInterface
 object NetworkUtils {
 
     /**
-     * 检查网络是否连接
+     * 检查网络是否连接。
+     *
+     * `activeNetwork` / `getNetworkCapabilities` 是 API 23 起才有的，而 minSdk 是 21 ——
+     * 在 Android 5.x 上直接调用会 NoSuchMethodError，且这两个方法在应用启动路径上，
+     * 结果就是一装上就闪退。低版本回退到已废弃但一直可用的 activeNetworkInfo。
      */
     fun isNetworkAvailable(context: Context): Boolean {
-        val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val network = connectivityManager.activeNetwork ?: return false
-        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
 
-        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val network = cm.activeNetwork ?: return false
+            val capabilities = cm.getNetworkCapabilities(network) ?: return false
+            return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        }
+
+        @Suppress("DEPRECATION")
+        return cm.activeNetworkInfo?.isConnected == true
     }
 
     /**
-     * 检查是否连接到 Wi-Fi
+     * 检查是否连接到 Wi-Fi。低版本同样回退到废弃 API，原因见 [isNetworkAvailable]。
      */
     fun isWifiConnected(context: Context): Boolean {
-        val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val network = connectivityManager.activeNetwork ?: return false
-        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
 
-        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val network = cm.activeNetwork ?: return false
+            val capabilities = cm.getNetworkCapabilities(network) ?: return false
+            return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+        }
+
+        @Suppress("DEPRECATION")
+        return cm.activeNetworkInfo?.type == ConnectivityManager.TYPE_WIFI
     }
 
     /**

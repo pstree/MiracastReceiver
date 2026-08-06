@@ -10,6 +10,7 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pManager
 import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
+import androidx.core.content.ContextCompat
 import android.os.Looper
 import timber.log.Timber
 
@@ -26,8 +27,13 @@ class WifiDirectManager(
     private val context: Context,
     private val deviceName: String
 ) {
-    private val manager: WifiP2pManager by lazy {
-        context.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
+    /**
+     * 不少老电视（尤其非 Android TV 认证的整机）根本没有 Wi-Fi Direct，
+     * `getSystemService` 会返回 null。原先用非空强转，一启动就抛异常闪退 ——
+     * 而 Miracast 只是三种投屏方式之一，不该拖垮整个应用。
+     */
+    private val manager: WifiP2pManager? by lazy {
+        context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
     }
 
     private var channel: WifiP2pManager.Channel? = null
@@ -44,8 +50,14 @@ class WifiDirectManager(
             return
         }
 
+        val p2p = manager
+        if (p2p == null) {
+            Timber.w("本机不支持 Wi-Fi Direct，Miracast 不可用（AirPlay / DLNA 不受影响）")
+            return
+        }
+
         try {
-            channel = manager.initialize(context, Looper.getMainLooper(), null)
+            channel = p2p.initialize(context, Looper.getMainLooper(), null)
 
             if (channel == null) {
                 Timber.e("Failed to initialize Wi-Fi P2P channel")
@@ -140,12 +152,12 @@ class WifiDirectManager(
         val ch = channel ?: return
 
         try {
-            manager.createGroup(ch, object : WifiP2pManager.ActionListener {
+            manager?.createGroup(ch, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     Timber.i("Wi-Fi Direct group created successfully")
 
                     // 查询组信息
-                    manager.requestGroupInfo(ch) { group ->
+                    manager?.requestGroupInfo(ch) { group ->
                         if (group != null) {
                             Timber.i("Group created - SSID: ${group.networkName}, Owner: ${group.isGroupOwner}")
                             onGroupCreated?.invoke(group)
@@ -168,7 +180,7 @@ class WifiDirectManager(
                     // 如果失败，尝试作为客户端模式
                     if (reason == WifiP2pManager.BUSY) {
                         // 可能已经有组存在，尝试获取当前组信息
-                        manager.requestGroupInfo(ch) { group ->
+                        manager?.requestGroupInfo(ch) { group ->
                             if (group != null) {
                                 Timber.i("Existing group found: ${group.networkName}")
                                 onGroupCreated?.invoke(group)
@@ -223,7 +235,7 @@ class WifiDirectManager(
                 "_miracast", "_tcp", record
             )
 
-            manager.addLocalService(ch, serviceInfo, object : WifiP2pManager.ActionListener {
+            manager?.addLocalService(ch, serviceInfo, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     Timber.i("Local Miracast service registered")
                 }
@@ -234,7 +246,7 @@ class WifiDirectManager(
             })
 
             // 开始服务发现
-            manager.discoverServices(ch, object : WifiP2pManager.ActionListener {
+            manager?.discoverServices(ch, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     Timber.i("Service discovery started")
                 }
@@ -243,6 +255,9 @@ class WifiDirectManager(
                     Timber.e("Failed to start service discovery: $reason")
                 }
             })
+        } catch (e: SecurityException) {
+            // 用户拒绝定位权限时走这里 —— Miracast 用不了，但不该影响 AirPlay / DLNA
+            Timber.w("注册 P2P 本地服务被拒绝（缺少定位权限），Miracast 不可用")
         } catch (e: Exception) {
             Timber.e(e, "Error registering local service")
         }
@@ -267,9 +282,15 @@ class WifiDirectManager(
 
                     WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
                         Timber.d("Wi-Fi P2P peers changed")
+                        // requestPeers 需要定位权限，用户拒绝时会抛 SecurityException。
+                        // 这里是广播回调，异常没人接就直接崩掉整个应用。
                         channel?.let { ch ->
-                            manager.requestPeers(ch) { peerList ->
-                                Timber.d("Peers discovered: ${peerList.deviceList.size}")
+                            try {
+                                manager?.requestPeers(ch) { peerList ->
+                                    Timber.d("Peers discovered: ${peerList.deviceList.size}")
+                                }
+                            } catch (e: SecurityException) {
+                                Timber.w("requestPeers 被拒绝（缺少定位权限）")
                             }
                         }
                     }
@@ -277,7 +298,7 @@ class WifiDirectManager(
                     WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
                         Timber.d("Wi-Fi P2P connection changed")
                         channel?.let { ch ->
-                            manager.requestConnectionInfo(ch) { info ->
+                            manager?.requestConnectionInfo(ch) { info ->
                                 if (info.groupFormed) {
                                     Timber.i("P2P Group formed - Group Owner: ${info.isGroupOwner}")
 
@@ -298,7 +319,12 @@ class WifiDirectManager(
         }
 
         try {
-            context.registerReceiver(receiver, intentFilter, Context.RECEIVER_NOT_EXPORTED)
+            // 必须走 ContextCompat：带 flags 的 registerReceiver 重载是 API 26 才有的，
+            // 在 Android 5/6/7 上直接调用会抛 NoSuchMethodError 导致应用一启动就闪退
+            // （minSdk 是 21，这类老电视确实装得上）。
+            ContextCompat.registerReceiver(
+                context, receiver, intentFilter, ContextCompat.RECEIVER_NOT_EXPORTED
+            )
             Timber.i("Wi-Fi P2P broadcast receiver registered")
         } catch (e: Exception) {
             Timber.e(e, "Failed to register Wi-Fi P2P receiver")
@@ -311,7 +337,7 @@ class WifiDirectManager(
         try {
             // 移除本地服务
             channel?.let { ch ->
-                manager.clearLocalServices(ch, object : WifiP2pManager.ActionListener {
+                manager?.clearLocalServices(ch, object : WifiP2pManager.ActionListener {
                     override fun onSuccess() {
                         Timber.i("Local services cleared")
                     }
@@ -322,7 +348,7 @@ class WifiDirectManager(
                 })
 
                 // 移除组
-                manager.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                manager?.removeGroup(ch, object : WifiP2pManager.ActionListener {
                     override fun onSuccess() {
                         Timber.i("Wi-Fi Direct group removed")
                     }

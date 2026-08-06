@@ -4,6 +4,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Build
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -307,7 +308,7 @@ class AudioStreamServer(
     private fun playAlacFrame(frame: ByteArray) {
         val pcm = alac?.decode(frame) ?: return
         if (firstPcm) { Logger.i("Audio: first decoded ALAC PCM (${pcm.size}B) → AudioTrack"); firstPcm = false }
-        audioTrack?.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
+        writePcmBlocking(pcm)
     }
 
     /** True if this RTP sequence was already processed (a redundant retransmission). */
@@ -344,7 +345,7 @@ class AudioStreamServer(
             if (firstPcm) { Logger.i("Audio: first decoded PCM (${pcm.size}B) → AudioTrack"); firstPcm = false }
             // Blocking write paces playback to the audio clock and drops no PCM. Safe here because
             // this runs on the dedicated playback thread, not the socket-receive thread.
-            audioTrack?.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
+            writePcmBlocking(pcm)
             mc.releaseOutputBuffer(outIdx, false)
             outIdx = mc.dequeueOutputBuffer(info, 0)
         }
@@ -387,27 +388,54 @@ class AudioStreamServer(
         val bytesPerSec = sampleRate * channels * 2
         Logger.i("AudioTrack: minBuf=${minBuf}B (~${minBuf * 1000 / bytesPerSec}ms), " +
             "buffer=${minBuf * 2}B (~${minBuf * 2 * 1000 / bytesPerSec}ms latency)")
-        audioTrack = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                    .build()
+        // AudioTrack.Builder 是 API 23 起才有的，minSdk 是 21 —— Android 5.x 上会
+        // NoSuchMethodError，只能回退到已废弃的老式构造函数。缓冲区策略两条路径保持一致。
+        audioTrack = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(channelMask)
+                        .build()
+                )
+                // Minimum buffer for LOW LATENCY so audio lines up with the (immediately-rendered)
+                // video. The upstream dedup jitter queue absorbs network jitter, so AudioTrack itself
+                // only needs the floor. (If this underruns/crackles on load, raise toward minBuf*2.)
+                .setBufferSizeInBytes(minBuf)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            AudioTrack(
+                android.media.AudioManager.STREAM_MUSIC,
+                sampleRate,
+                channelMask,
+                AudioFormat.ENCODING_PCM_16BIT,
+                minBuf,
+                AudioTrack.MODE_STREAM
             )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(channelMask)
-                    .build()
-            )
-            // Minimum buffer for LOW LATENCY so audio lines up with the (immediately-rendered)
-            // video. The upstream dedup jitter queue absorbs network jitter, so AudioTrack itself
-            // only needs the floor. (If this underruns/crackles on load, raise toward minBuf*2.)
-            .setBufferSizeInBytes(minBuf)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
-            .also { it.setVolume(volumeGain); it.play() }
+        }.also { it.setVolume(volumeGain); it.play() }
+    }
+
+    /**
+     * 阻塞写入 PCM。带 WRITE_BLOCKING 标志的 write 重载是 API 23 起才有的；
+     * 低版本上老式 write 本身就是阻塞语义，行为一致。
+     */
+    private fun writePcmBlocking(pcm: ByteArray) {
+        val track = audioTrack ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            track.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
+        } else {
+            @Suppress("DEPRECATION")
+            track.write(pcm, 0, pcm.size)
+        }
     }
 
     companion object {

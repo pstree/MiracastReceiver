@@ -3,6 +3,7 @@
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.os.Build
 import com.weekd.miracastreceiver.util.Logger
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -155,7 +156,7 @@ class AudioPlayer {
 
             // Step 4: Write to AudioTrack for playback
             // WRITE_NON_BLOCKING returns immediately if the buffer is full (prevents stalls)
-            audioTrack?.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
+            writePcm(pcm)
 
         } catch (e: Exception) {
             Logger.e("Error playing audio packet", e)
@@ -217,6 +218,21 @@ class AudioPlayer {
      * @param sampleRate Audio sample rate (e.g., 44100 Hz)
      * @param channels   Number of channels (1 = mono, 2 = stereo)
      */
+    /**
+     * 写入 PCM。带 WRITE_NON_BLOCKING 标志的 write 重载是 API 23 起才有的，
+     * minSdk 是 21，低版本只能用老式 write（阻塞语义）。这条路径每包都会走，
+     * 在 Android 5.x 上直接调新重载会 NoSuchMethodError。
+     */
+    private fun writePcm(pcm: ByteArray) {
+        val track = audioTrack ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            track.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
+        } else {
+            @Suppress("DEPRECATION")
+            track.write(pcm, 0, pcm.size)
+        }
+    }
+
     private fun initializeAudioTrack(sampleRate: Int, channels: Int) {
         // Map channel count to Android's AudioFormat constant
         val channelConfig = when (channels) {
@@ -238,23 +254,37 @@ class AudioPlayer {
         // Use 2x the minimum buffer size for more stability
         val bufferSize = minBufferSize * 2
 
-        audioTrack = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                    .build()
+        // AudioTrack.Builder 是 API 23 起才有的，而 minSdk 是 21 ——
+        // Android 5.x 上直接用会 NoSuchMethodError，只能回退到已废弃的老式构造函数。
+        audioTrack = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(channelConfig)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(bufferSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)  // STREAM = for continuous audio
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            AudioTrack(
+                android.media.AudioManager.STREAM_MUSIC,
+                sampleRate,
+                channelConfig,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize,
+                AudioTrack.MODE_STREAM
             )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(channelConfig)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .build()
-            )
-            .setBufferSizeInBytes(bufferSize)
-            .setTransferMode(AudioTrack.MODE_STREAM)  // STREAM = for continuous audio
-            .build()
+        }
 
         audioTrack!!.play()
         Logger.d("AudioTrack initialized: ${sampleRate}Hz, $channels ch, buffer=$bufferSize bytes")

@@ -13,6 +13,7 @@ import android.content.Context
 import android.hardware.display.DisplayManager
 import android.view.Display
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.weekd.miracastreceiver.R
 import com.weekd.miracastreceiver.airplay.AirPlayReceiver
 import com.weekd.miracastreceiver.discovery.DeviceInfoProvider
@@ -127,18 +128,31 @@ class CastReceiverService : Service() {
             addAction(ACTION_UPDATE_POSITION)
             addAction(ACTION_PLAYBACK_STOPPED)
         }
-        registerReceiver(playerStateReceiver, playerStateFilter, RECEIVER_NOT_EXPORTED)
+        // ContextCompat 而非直接调用：带 flags 的重载是 API 26 才有的，
+        // 老电视（Android 5/6/7）上直接调会 NoSuchMethodError 闪退。
+        ContextCompat.registerReceiver(
+            this, playerStateReceiver, playerStateFilter, ContextCompat.RECEIVER_NOT_EXPORTED
+        )
     }
 
     private fun getBestDisplayResolution(): Pair<Int, Int> {
-        val display = (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
-            .getDisplay(Display.DEFAULT_DISPLAY)
-        val mode = display?.supportedModes
-            ?.maxByOrNull { it.physicalWidth * it.physicalHeight }
-            ?: display?.mode
+        // Display.getSupportedModes / getMode 是 API 23 起才有的，而 minSdk 是 21。
+        // 这个方法在服务 onCreate 里调用，低版本上直接调会 NoSuchMethodError 闪退，
+        // 所以 Android 5.x 直接用 displayMetrics（精度略低但够用）。
+        var width = resources.displayMetrics.widthPixels
+        var height = resources.displayMetrics.heightPixels
 
-        val width = mode?.physicalWidth ?: resources.displayMetrics.widthPixels
-        val height = mode?.physicalHeight ?: resources.displayMetrics.heightPixels
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val display = (getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+                ?.getDisplay(Display.DEFAULT_DISPLAY)
+            val mode = display?.supportedModes
+                ?.maxByOrNull { it.physicalWidth * it.physicalHeight }
+                ?: display?.mode
+            if (mode != null) {
+                width = mode.physicalWidth
+                height = mode.physicalHeight
+            }
+        }
         val longSide = maxOf(width, height).coerceIn(1280, 3840)
         val shortSide = minOf(width, height).coerceIn(720, 2160)
         return longSide to shortSide

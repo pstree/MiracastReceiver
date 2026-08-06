@@ -22,6 +22,7 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
@@ -921,7 +922,10 @@ class PlayerActivity : AppCompatActivity() {
             addAction(ACTION_SET_SPEED)
             addAction(ACTION_SET_QUALITY_URL)
         }
-        registerReceiver(controlReceiver, filter, RECEIVER_NOT_EXPORTED)
+        // 同上：带 flags 的 registerReceiver 是 API 26 起才有的重载
+        ContextCompat.registerReceiver(
+            this, controlReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED
+        )
     }
 
     override fun onStart() {

@@ -294,6 +294,9 @@ class PlayerActivity : AppCompatActivity() {
             }
 
         playerView.player = player
+        // 控制条（含进度条）默认隐藏：切到下一个视频/开始播放时不再自动弹出来。
+        // 需要时仍可通过按下确认键 / 点按画面手动呼出。
+        playerView.setControllerAutoShow(false)
         playerView.setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
             findViewById<View?>(R.id.status_bar)?.visibility = visibility
             isControllerVisible = visibility == View.VISIBLE

@@ -31,7 +31,9 @@ import java.nio.charset.StandardCharsets
 class WfdSessionHandler(
     private val context: Context,
     private val socket: Socket,
-    private val rtpPort: Int
+    private val rtpPort: Int,
+    /** 想在能力声明里开放的 CEA 分辨率位图，供降级用（见 WfdServer）。 */
+    private val ceaBitmap: Long = DEFAULT_CEA_BITMAP
 ) {
     private val input: InputStream = socket.getInputStream()
     private val output: OutputStream = socket.getOutputStream()
@@ -40,6 +42,9 @@ class WfdSessionHandler(
     private var sessionId = ""
     private var presentationUrl = ""
     private var playRequested = false
+
+    /** 握手完成后暴露源端 RTP 端口；RTCP 端口 = RTP + 1。 */
+    var onSourceRtpPort: ((sourceRtpPort: Int) -> Unit)? = null
 
     var onSessionEstablished: ((sessionId: String) -> Unit)? = null
     var onStreamStart: ((rtpPort: Int) -> Unit)? = null
@@ -62,9 +67,12 @@ class WfdSessionHandler(
          * 这个等待直接等于帧间隔，是延迟的大头。
          *
          * level 同步提到 0x10（H.264 Level 4.2）：1080p60 超出了 Level 4.0 的上限。
+         *
+         * L2 档（重丢包时降级用）把上限压到 720p30，彻底避开 1080p 的高码率。
          */
-        private const val VIDEO_FORMATS =
-            "00 00 02 10 000001C0 00000000 00000000 00 0000 0000 00 none none"
+        const val DEFAULT_CEA_BITMAP = 0x000001C0L   // 1080p60 / 1080p30 / 720p60
+        private const val VIDEO_FORMATS_PREFIX =
+            "00 00 02 10 %08X 00000000 00000000 00 0000 0000 00 none none"
         private const val AUDIO_CODECS = "AAC 00000001 00"
     }
 
@@ -179,6 +187,18 @@ class WfdSessionHandler(
 
     // ─── 处理 Source 对我们请求的响应 ────────────────────────────────────────
     private fun handleResponse(msg: String) {
+        // SETUP 响应里的 Transport 头带 server_port=源端RTP-源端RTCP，
+        // 解析出来供 RTCP 反馈（PLI）使用；解析失败不影响主流程。
+        header(msg, "Transport")?.let { transport ->
+            Regex("(?i)server_port=(\\d+)-(\\d+)").find(transport)?.let { m ->
+                val sourceRtp = m.groupValues[1].toIntOrNull()
+                if (sourceRtp != null && sourceRtp > 0 && sourceRtp < 65535) {
+                    Timber.i("WFD: source RTP port = $sourceRtp (RTCP = ${sourceRtp + 1})")
+                    onSourceRtpPort?.invoke(sourceRtp)
+                }
+            }
+        }
+
         val session = header(msg, "Session")?.substringBefore(';')
         if (!session.isNullOrBlank() && sessionId.isEmpty()) {
             sessionId = session
@@ -230,8 +250,9 @@ class WfdSessionHandler(
      * 只回下面这几项标准参数它照样接受并推进到 M4。
      */
     private fun sendCapabilities(cseq: String) {
+        val videoFormats = VIDEO_FORMATS_PREFIX.format(ceaBitmap)
         val body = buildString {
-            append("wfd_video_formats: $VIDEO_FORMATS\r\n")
+            append("wfd_video_formats: $videoFormats\r\n")
             append("wfd_audio_codecs: $AUDIO_CODECS\r\n")
             // 关键：告诉 Source 往哪个 UDP 端口发 RTP，缺了这项收不到画面
             append("wfd_client_rtp_ports: RTP/AVP/UDP;unicast $rtpPort 0 mode=play\r\n")

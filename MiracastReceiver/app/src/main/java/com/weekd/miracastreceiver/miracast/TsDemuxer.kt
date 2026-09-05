@@ -20,14 +20,20 @@ import java.io.ByteArrayOutputStream
  *
  * @param onAccessUnit 收到完整访问单元时回调（Annex B 字节 + PTS 微秒）
  * @param onDiscontinuity 检测到丢包时回调，接收方应丢弃到下一个关键帧
+ * @param onAudio 收到音频 PES 负载时回调（AAC ADTS，MPEG-TS 直接封装）。
+ *        交给接收方后，由其喂给 MediaCodec 音频解码器 —— 音频解码器对输入块边界
+ *        是自愈的（内部会缓冲未凑齐的 ADTS 帧），所以这里**不做**帧拼装，forward
+ *        原始切片即可，既降低延迟也避免丢状态。
  */
 class TsDemuxer(
     private val onAccessUnit: (data: ByteArray, ptsUs: Long) -> Unit,
-    private val onDiscontinuity: () -> Unit = {}
+    private val onDiscontinuity: () -> Unit = {},
+    private val onAudio: (data: ByteArray) -> Unit = {}
 ) {
 
     private var pmtPid = -1
     private var videoPid = -1
+    private var audioPid = -1
 
     private val pes = ByteArrayOutputStream(256 * 1024)
     private var pendingPts = 0L
@@ -42,6 +48,7 @@ class TsDemuxer(
         private const val SYNC_BYTE = 0x47.toByte()
         private const val STREAM_TYPE_H264 = 0x1B
         private const val STREAM_TYPE_HEVC = 0x24
+        private const val STREAM_TYPE_AAC = 0x0F
     }
 
     /** 喂入一段 TS 数据（必须是 188 字节包对齐的，RTP 负载天然满足）。 */
@@ -94,6 +101,7 @@ class TsDemuxer(
                 lastContinuity = continuity
                 parseVideoPes(data, payloadStart, payloadEnd, payloadUnitStart)
             }
+            audioPid -> parseAudioPes(data, payloadStart, payloadEnd, payloadUnitStart)
         }
     }
 
@@ -127,9 +135,9 @@ class TsDemuxer(
         }
     }
 
-    /** PMT：找出 H.264（或 HEVC）基本流的 PID。 */
+    /** PMT：找出 H.264（或 HEVC）与 AAC 基本流的 PID，一次扫完整个段。 */
     private fun parsePmt(data: ByteArray, start: Int, end: Int, payloadUnitStart: Boolean) {
-        if (videoPid >= 0) return
+        if (videoPid >= 0 && audioPid >= 0) return
         var pos = start
         if (payloadUnitStart) pos += 1 + (data[pos].toInt() and 0xFF)
         if (pos + 12 > end) return
@@ -145,10 +153,15 @@ class TsDemuxer(
             val pid = ((data[entry + 1].toInt() and 0x1F) shl 8) or (data[entry + 2].toInt() and 0xFF)
             val esInfoLength = ((data[entry + 3].toInt() and 0x0F) shl 8) or (data[entry + 4].toInt() and 0xFF)
 
-            if (streamType == STREAM_TYPE_H264 || streamType == STREAM_TYPE_HEVC) {
-                videoPid = pid
-                Timber.i("TS: video pid = $videoPid (stream_type 0x%02X)".format(streamType))
-                return
+            when (streamType) {
+                STREAM_TYPE_H264, STREAM_TYPE_HEVC -> if (videoPid < 0) {
+                    videoPid = pid
+                    Timber.i("TS: video pid = $pid (stream_type 0x%02X)".format(streamType))
+                }
+                STREAM_TYPE_AAC -> if (audioPid < 0) {
+                    audioPid = pid
+                    Timber.i("TS: audio pid = $pid (AAC)")
+                }
             }
             entry += 5 + esInfoLength
         }
@@ -211,7 +224,27 @@ class TsDemuxer(
     fun reset() {
         pmtPid = -1
         videoPid = -1
+        audioPid = -1
         lastContinuity = -1
         discardPending()
+    }
+
+    /**
+     * 音频 PES。ADTS/AAC 在 TS 里以 PES 直接封装、长度已知，且解码器对输入块边界
+     * 自愈，所以这里不需要像视频那样攒整帧 —— 直接把每次切片 forward
+     * 给上层即可（PES 头只占首包）。
+     */
+    private fun parseAudioPes(data: ByteArray, start: Int, end: Int, payloadUnitStart: Boolean) {
+        var pos = start
+        if (payloadUnitStart) {
+            if (pos + 9 > end) return
+            // packet_start_code_prefix 必须是 00 00 01
+            if (data[pos].toInt() != 0x00 || data[pos + 1].toInt() != 0x00 ||
+                (data[pos + 2].toInt() and 0xFF) != 0x01
+            ) return
+            val headerDataLength = data[pos + 8].toInt() and 0xFF
+            pos += 9 + headerDataLength
+        }
+        if (pos < end) onAudio(data.copyOfRange(pos, end))
     }
 }

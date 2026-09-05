@@ -1,5 +1,6 @@
 package com.weekd.miracastreceiver.miracast
 
+import android.os.SystemClock
 import android.view.Surface
 import kotlinx.coroutines.*
 import java.util.concurrent.ArrayBlockingQueue
@@ -7,6 +8,7 @@ import java.util.concurrent.TimeUnit
 import timber.log.Timber
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.InetSocketAddress
 
 /**
  * Miracast RTP 接收器。
@@ -35,7 +37,8 @@ class RtpReceiver(
     private var isRunning = false
 
     private val renderer = MiracastVideoRenderer(surfaceProvider)
-    private val demuxer = TsDemuxer(renderer::onAccessUnit, renderer::onDiscontinuity)
+    private val audioRenderer = MiracastAudioRenderer()
+    private val demuxer = TsDemuxer(renderer::onAccessUnit, renderer::onDiscontinuity, audioRenderer::enqueue)
 
     /**
      * 接收线程与解码线程之间的缓冲。
@@ -61,6 +64,42 @@ class RtpReceiver(
 
     var onError: ((String) -> Unit)? = null
 
+    /**
+     * 持续重度丢包回调（由 WfdServer 用它触发降级重连）。
+     * 仅在连续监测窗口内丢包率超过阈值时触发一次，恢复后允许再次触发。
+     */
+    @Volatile
+    var onHeavyLoss: (() -> Unit)? = null
+
+    // ─── RTCP 反馈（丢包时向源端发 PLI，催促其尽快出新的关键帧）─────────────
+    /** 源端 RTP 目的地址；RTCP 端口按 RTP+1 推导。握手结束后由 WfdServer 填入。 */
+    @Volatile
+    private var rtcpTarget: InetSocketAddress? = null
+
+    // 在 WfdServer 线程写、接收线程读，必须保证可见性
+    @Volatile
+    private var feedbackSocket: DatagramSocket? = null
+
+    /** 上一次发送 PLI 的时刻，用于节流（爆发丢包时不能无限刷包）。 */
+    @Volatile
+    private var lastPlISendMs = 0L
+
+    /** 本会话自己声明的 SSRC（发给源端时用）。 */
+    private val senderSsrc = (SystemClock.elapsedRealtime() and 0xFFFF).toInt() or 0x53000000
+
+    /** 捕获的源端媒体 SSRC（从收到的 RTP 头里读），PLI 里要带上它。 */
+    @Volatile
+    private var mediaSsrc = 0
+
+    // ─── 丢包率滚动监测（降级判据） ─────────────────────────────────────────
+    private var lossWindowReceived = 0L
+    private var lossWindowLost = 0L
+    private var lossWindowStartMs = 0L
+    private var heavyLossArmed = true
+
+    /** 会话建立后的前几秒不参与降级判定，避免启动/重连瞬间的突发丢包误触发降级。 */
+    private var heavyLossReadyAtMs = 0L
+
     companion object {
         /** 当前会话的接收器，供视频信息面板读取统计量。 */
         @Volatile
@@ -75,6 +114,7 @@ class RtpReceiver(
 
         active = this
 
+        audioRenderer.start()
         scope.launch { runDecoder() }
 
         scope.launch {
@@ -84,6 +124,8 @@ class RtpReceiver(
                     runCatching { receiveBufferSize = 1024 * 1024 }
                 }
                 isRunning = true
+                // 降级判定暖机时间：前几秒可能是握手/画面首帧突发，不代表链路持续拥塞
+                heavyLossReadyAtMs = SystemClock.elapsedRealtime() + 5000
                 Timber.i("RTP Receiver listening on UDP $port (expecting MPEG-2 TS, PT=33), " +
                     "recvBuf=${socket?.receiveBufferSize}")
 
@@ -111,14 +153,26 @@ class RtpReceiver(
                                 "payload=${packet.length - payloadOffset}B")
                         }
 
+                        // 记住源端媒体 SSRC，PLI 里需要带它
+                        if (packet.length >= 8) {
+                            mediaSsrc = ((packet.data[4].toInt() and 0xFF) shl 24) or
+                                ((packet.data[5].toInt() and 0xFF) shl 16) or
+                                ((packet.data[6].toInt() and 0xFF) shl 8) or
+                                (packet.data[7].toInt() and 0xFF)
+                        }
+
                         // RTP 序号跳变 = 网络丢包，残缺的帧不能喂给解码器
                         val seq = ((packet.data[2].toInt() and 0xFF) shl 8) or
                             (packet.data[3].toInt() and 0xFF)
                         if (expectedSeq >= 0 && seq != expectedSeq) {
                             val lost = (seq - expectedSeq + 0x10000) and 0xFFFF
                             packetsLost += lost
+                            updateLossWindow(lost.toLong())
                             Timber.w("RTP: lost $lost packets (seq $expectedSeq → $seq)")
                             renderer.onDiscontinuity()
+                            sendPlI()                       // 催促源端尽快出关键帧
+                        } else {
+                            updateLossWindow(0)
                         }
                         expectedSeq = (seq + 1) and 0xFFFF
 
@@ -128,6 +182,7 @@ class RtpReceiver(
                             payloadQueue.poll()
                             payloadQueue.offer(payload)
                             renderer.onDiscontinuity()
+                            sendPlI()
                         }
 
                         if (packetsReceived % 1000L == 0L) {
@@ -187,6 +242,7 @@ class RtpReceiver(
         isRunning = false
         scope.cancel()
         renderer.release()
+        audioRenderer.release()
         demuxer.reset()
         if (active === this) active = null
 
@@ -196,8 +252,96 @@ class RtpReceiver(
         } catch (e: Exception) {
             Timber.e(e, "Error closing RTP socket")
         }
+        try {
+            feedbackSocket?.close()
+            feedbackSocket = null
+        } catch (e: Exception) {
+            Timber.e(e, "Error closing feedback socket")
+        }
+        rtcpTarget = null
         Timber.i("RTP Receiver stopped: $packetsReceived packets, ${bytesReceived / 1024}KB")
     }
 
     fun isRunning(): Boolean = isRunning
+
+    /**
+     * 握手完成后设置源端信息：告诉接收器往哪里发 RTCP 反馈（PLI）。
+     * @param sourceIp 源端（发送方）IP
+     * @param sourceRtpPort 源端发送视频 RTP 的端口；其 RTCP 端口 = RTP 端口 + 1
+     */
+    fun setFeedbackTarget(sourceIp: String, sourceRtpPort: Int) {
+        if (sourceRtpPort <= 0 || sourceRtpPort >= 65535) return
+        rtcpTarget = InetSocketAddress(sourceIp, sourceRtpPort + 1)
+        if (feedbackSocket == null) {
+            // 优先绑到本机 RTCP 端口（RTP+1）以符合 RFC；被占用则退回任选端口。
+            // 不阻塞接收线程：一个赋值为空或发送失败的 UDP 端口不值得中断链路。
+            feedbackSocket = runCatching { DatagramSocket(port + 1) }
+                .getOrElse { runCatching { DatagramSocket() }.getOrNull() }
+            Timber.d("RTP: feedback socket ready → $rtcpTarget")
+        }
+    }
+
+    /**
+     * 发送 RTCP PLI（Picture Loss Indication，RFC 4585 PSFB/FMT=1）。
+     * 源端收到后应尽快推送一个新的关键帧，从而把「丢包后等自然关键帧」的秒级
+     * 冻结压缩到一两个帧间隔。整个报文 12 字节：公共头 + 发送方 SSRC + 媒体 SSRC。
+     */
+    private fun sendPlI() {
+        val target = rtcpTarget ?: return
+        val sock = feedbackSocket ?: return
+        // 节流：PLI 只用于催促尽快出一个关键帧，爆发丢包时 200ms 内刷一次就够
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastPlISendMs < 200) return
+        lastPlISendMs = now
+        try {
+            val p = ByteArray(12)
+            p[0] = 0x81.toByte()              // V=2, P=0, FMT=1(PLI)
+            p[1] = 206.toByte()               // PSFB (payload-specific feedback)
+            p[2] = 0; p[3] = 2                 // length = (12/4) - 1 = 2
+            putInt(p, 4, senderSsrc)
+            putInt(p, 8, mediaSsrc)
+            sock.send(DatagramPacket(p, p.size, target))
+        } catch (e: Exception) {
+            if (isRunning) Timber.d(e, "RTCP PLI send failed")
+        }
+    }
+
+    private fun putInt(buf: ByteArray, offset: Int, value: Int) {
+        buf[offset] = (value ushr 24).toByte()
+        buf[offset + 1] = (value ushr 16).toByte()
+        buf[offset + 2] = (value ushr 8).toByte()
+        buf[offset + 3] = value.toByte()
+    }
+
+    /** 按最近一秒的窗口估算丢包率，持续偏高时触发 [onHeavyLoss]。 */
+    private fun updateLossWindow(lost: Long) {
+        lossWindowReceived++
+        lossWindowLost += lost
+        val now = SystemClock.elapsedRealtime()
+        if (lossWindowStartMs == 0L) lossWindowStartMs = now
+        if (now - lossWindowStartMs < 1000L) return
+        // 暖机期内只统计不触发，避免握手/首帧瞬间的突发丢包直接降级
+        if (now < heavyLossReadyAtMs) {
+            lossWindowReceived = 0L
+            lossWindowLost = 0L
+            lossWindowStartMs = now
+            return
+        }
+
+        val received = lossWindowReceived
+        val lostInWindow = lossWindowLost
+        lossWindowReceived = 0L
+        lossWindowLost = 0L
+        lossWindowStartMs = now
+
+        val rate = if (received > 0) lostInWindow.toFloat() / received else 0f
+        when {
+            rate > 0.06f && heavyLossArmed -> {
+                heavyLossArmed = false
+                Timber.w("RTP: sustained heavy loss ${(rate * 100).toInt()}% → suggesting degrade")
+                onHeavyLoss?.invoke()
+            }
+            rate < 0.02f -> heavyLossArmed = true   // 已恢复，允许后续再次触发
+        }
+    }
 }

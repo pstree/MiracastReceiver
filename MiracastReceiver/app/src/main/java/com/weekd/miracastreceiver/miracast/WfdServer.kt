@@ -48,7 +48,20 @@ class WfdServer(
         private const val SCAN_INTERVAL_MS = 3_000L
         private const val CONNECT_TIMEOUT_MS = 400
         private const val SCAN_CHUNK = 32          // 每批并发探测的地址数
+
+        /**
+         * 按降级档位开放的 CEA 分辨率位图。重丢包时依次收起高档位，逼 Windows
+         * 选更省带宽的模式，从而保住链路不彻底断线：
+         *   L0: 1080p60/1080p30/720p60
+         *   L1: 1080p30/720p60
+         *   L2: 720p60
+         */
+        private val DEGRADE_CEA = longArrayOf(0x000001C0L, 0x000000C0L, 0x00000040L)
     }
+
+    /** 当前降级档位；只在重丢包时提升，不回退（避免画面档次反复跳动）。 */
+    @Volatile
+    private var degradeLevel = 0
 
     fun start() {
         if (isRunning) {
@@ -56,6 +69,8 @@ class WfdServer(
             return
         }
         isRunning = true
+        // 重新开始一次投屏，档位复位为全高清；之后只会因为重丢包而单向下调
+        degradeLevel = 0
         Timber.i("WFD session starter running (will dial source:$port, RTP on $rtpPort)")
 
         scope.launch {
@@ -134,11 +149,14 @@ class WfdServer(
         // 播放页尚未创建时返回 null，解码器会等它就绪。
         val receiver = RtpReceiver(rtpPort, { com.weekd.miracastreceiver.ui.PlayerActivity.mirrorSurface }).apply {
             onError = { Timber.e("Miracast RTP error: $it") }
+            onHeavyLoss = { downgradeAndReconnect() }
             start()
         }
         rtpReceiver = receiver
 
-        val handler = WfdSessionHandler(context, socket, rtpPort).apply {
+        val handler = WfdSessionHandler(context, socket, rtpPort, currentCeaBitmap()).apply {
+            // 握手解析到源端 RTP 端口后，把 RTCP 反馈目标填给接收器
+            onSourceRtpPort = { sourceRtp -> receiver.setFeedbackTarget(sourceIp, sourceRtp) }
             onSessionEstablished = { onConnectionEstablished?.invoke(it) }
             onStreamStart = { onStreamStarted?.invoke(it) }
             onStreamStop = { onStreamStopped?.invoke() }
@@ -152,6 +170,25 @@ class WfdServer(
             rtpReceiver = null
             sessionHandler = null
         }
+    }
+
+    /** 当前降级档位对应的 CEA 分辨率位图。 */
+    private fun currentCeaBitmap(): Long =
+        DEGRADE_CEA[degradeLevel.coerceIn(0, DEGRADE_CEA.lastIndex)]
+
+    /**
+     * 持续重度丢包时的降级：提升档位后关闭当前会话，外层循环立刻重扫重连，
+     * 下一次握手按降低后的能力声明（1080p60 → 1080p30 → 720p60）重新协商。
+     */
+    private fun downgradeAndReconnect() {
+        if (degradeLevel >= DEGRADE_CEA.lastIndex) {
+            Timber.w("Miracast: already at lowest degrade level")
+            return
+        }
+        degradeLevel++
+        Timber.w("Miracast: sustained loss → degrade to L$degradeLevel (CEA=0x" +
+            "${currentCeaBitmap().toString(16)}), renegotiating")
+        sessionHandler?.close()
     }
 
     fun stop() {

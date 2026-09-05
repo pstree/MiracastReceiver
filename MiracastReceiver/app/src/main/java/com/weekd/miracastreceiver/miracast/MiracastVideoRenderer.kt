@@ -26,14 +26,17 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
     private var droppedBeforeConfig = 0
 
     /**
-     * 数据有丢失时调用：残缺的帧会让解码器输出花屏，而且错误会沿着帧间预测一直传播下去，
-     * 所以必须丢弃后续帧直到下一个 IDR 才重新开始解码。
+     * 数据有丢失时调用。
+     *
+     * 只在【起始/重建】阶段会回置等待关键帧；会话运行中段丢包**不做硬性冻结**：
+     * 之前「丢一个包就丢弃后续所有帧直到下一个关键帧」的做法，在 Windows 关键帧
+     * 间隔 1~4 秒时会变成整段画面冻结。改为保持把帧喂给解码器，由 MediaCodec 做
+     * 错误隐藏（error concealment），同时 [RtpReceiver] 会发 RTCP PLI 催促源端
+     * 尽快出一个新关键帧完成干净重同步 —— 冻结时长从秒级降到一两个帧间隔。
      */
     fun onDiscontinuity() {
-        if (!awaitingKeyframe) {
-            awaitingKeyframe = true
-            Timber.w("Miracast: data loss detected, waiting for next keyframe")
-        }
+        if (awaitingKeyframe) return     // 起始/重建阶段本就在等关键帧
+        Timber.w("Miracast: data loss, continuing decode with error concealment")
     }
 
     /** [TsDemuxer] 的回调入口。 */

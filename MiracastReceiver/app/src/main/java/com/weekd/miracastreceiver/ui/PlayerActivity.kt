@@ -433,17 +433,6 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN && !isDialogShowing) {
-            // 频道键切集：- 下一个、+ 上一个（用户定义的键位映射）
-            when (event.keyCode) {
-                KeyEvent.KEYCODE_CHANNEL_DOWN -> {
-                    playNextVideo()
-                    return true
-                }
-                KeyEvent.KEYCODE_CHANNEL_UP -> {
-                    playPrevVideo()
-                    return true
-                }
-            }
             // DPAD 下/上：下 = 跳到当前视频末尾（自然播完进下一集），上 = 跳到开头
             if (!isCurrentImage()) {
                 when (event.keyCode) {
@@ -768,13 +757,6 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
-    /** 遥控遥控键切集（备用映射）：频道 - 下一个、+ 上一个。播放列表为空时是空操作。 */
-    private fun playNextVideo() {
-        if (playlist.isEmpty()) return
-        currentIndex = (currentIndex + 1) % playlist.size
-        playCurrent()
-    }
-
     /**
      * 跳到当前视频末尾前 3 秒，让它自然播完并进入下一个视频。
      *
@@ -786,12 +768,6 @@ class PlayerActivity : AppCompatActivity() {
         val currentPlayer = player ?: return
         val duration = currentPlayer.duration.takeIf { it > 0 } ?: return
         currentPlayer.seekTo((duration - SEEK_TO_END_MARGIN_MS).coerceAtLeast(0L))
-    }
-
-    private fun playPrevVideo() {
-        if (playlist.isEmpty()) return
-        currentIndex = (currentIndex - 1 + playlist.size) % playlist.size
-        playCurrent()
     }
 
     private fun isCurrentImage(): Boolean = mediaUri?.let { isImageUri(it) } == true

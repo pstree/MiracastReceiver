@@ -23,6 +23,7 @@ import android.view.SurfaceView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
@@ -85,6 +86,11 @@ class PlayerActivity : AppCompatActivity() {
 
         private const val IMAGE_SLIDE_INTERVAL_MS = 5_000L
         private const val QUALITY_AUTO = -1
+        // DLNA 切集时 Stop→SetURI 连发：这个窗口内收到新 SetURI 就复用本页无缝续播，
+        // 窗口结束仍无新片源才真正退出，避免闪回主屏并重建播放器。
+        private const val STOP_DEBOUNCE_MS = 1_200L
+        // 向下方向键跳"末尾"时留的最后余量：跳到末尾前这段，让播放器走真实播完再切下一集
+        private const val SEEK_TO_END_MARGIN_MS = 1_000L
 
         // Kodi 风格连续快进快退：短时间内连续按键会加大跳转步长
         private const val SEEK_ACCEL_WINDOW_MS = 1_500L
@@ -131,8 +137,8 @@ class PlayerActivity : AppCompatActivity() {
     private var lastSeekWasForward = true
     private var lastSeekPressAt = 0L
     private var seekCommitJob: Job? = null
-    private var isControllerVisible = false
     private var isDialogShowing = false
+    private var stopDebounceJob: Job? = null
 
     private val controlReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -140,8 +146,28 @@ class PlayerActivity : AppCompatActivity() {
                 ACTION_PLAY -> if (isCurrentImage()) startImageSlideShow() else player?.play()
                 ACTION_PAUSE -> if (isCurrentImage()) stopImageSlideShow() else player?.pause()
                 ACTION_STOP -> {
-                    stopPlayback()
-                    finish()
+                    // 镜像/Miracast 断开：立即关播放页（它们用 mirrorSurface 直接送显，
+                    // 没有可续接的片源，留着只会停在最后一帧）。
+                    if (isMiracastSession || isAirPlayMirrorSession) {
+                        stopPlayback()
+                        finish()
+                        return
+                    }
+                    // DLNA：抖音切集常是 Stop→SetURI 连发。立即 finish 会闪回主屏
+                    // （“等待投屏连接”）并重建整个播放器（慢）。改为软停 + 短窗口：
+                    // 窗口内收到新 SetURI 就无缝续播，没来才真正退出。
+                    stopDebounceJob?.cancel()
+                    player?.stop()
+                    tvStatus.text = "已停止"
+                    updateBufferingState(false)
+                    stopDebounceJob = lifecycleScope.launch {
+                        delay(STOP_DEBOUNCE_MS)
+                        // 只在页面仍在前台时退出；切到后台等情况不强行 finish
+                        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                            stopPlayback()
+                            finish()
+                        }
+                    }
                 }
                 ACTION_SEEK -> {
                     val position = intent.getLongExtra(EXTRA_SEEK_POSITION, 0L)
@@ -298,9 +324,9 @@ class PlayerActivity : AppCompatActivity() {
         // 需要时仍可通过按下确认键 / 点按画面手动呼出。
         playerView.setControllerAutoShow(false)
         playerView.setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
-            findViewById<View?>(R.id.status_bar)?.visibility = visibility
-            isControllerVisible = visibility == View.VISIBLE
-        })
+                findViewById<View?>(R.id.status_bar)?.visibility = visibility
+                // 控制条显隐仅用于隐藏顶部状态栏；左右方向键现在始终用作 seek，不再依赖此标记
+            })
         playerView.setShowNextButton(true)
         playerView.setShowPreviousButton(true)
         setupControllerActions()
@@ -407,6 +433,30 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN && !isDialogShowing) {
+            // 频道键切集：- 下一个、+ 上一个（用户定义的键位映射）
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_CHANNEL_DOWN -> {
+                    playNextVideo()
+                    return true
+                }
+                KeyEvent.KEYCODE_CHANNEL_UP -> {
+                    playPrevVideo()
+                    return true
+                }
+            }
+            // DPAD 下/上：下 = 跳到当前视频末尾（自然播完进下一集），上 = 跳到开头
+            if (!isCurrentImage()) {
+                when (event.keyCode) {
+                    KeyEvent.KEYCODE_DPAD_DOWN -> {
+                        seekToEnd()
+                        return true
+                    }
+                    KeyEvent.KEYCODE_DPAD_UP -> {
+                        player?.seekTo(0)
+                        return true
+                    }
+                }
+            }
             // 镜像/Miracast 没有控制条，INFO / MENU 键是信息面板的唯一入口
             if (event.keyCode == KeyEvent.KEYCODE_INFO || event.keyCode == KeyEvent.KEYCODE_MENU) {
                 toggleStreamInfo()
@@ -424,15 +474,11 @@ class PlayerActivity : AppCompatActivity() {
             val isRewindKey = event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
                 event.keyCode == KeyEvent.KEYCODE_MEDIA_REWIND
             if (isForwardKey || isRewindKey) {
-                val isHardwareSeekKey = event.keyCode == KeyEvent.KEYCODE_MEDIA_REWIND ||
-                    event.keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
-                val inSeekMode = SystemClock.elapsedRealtime() - lastSeekPressAt <= SEEK_ACCEL_WINDOW_MS
-                // 方向键仅在 OSD 未显示或正处于连续快进快退中时才拦截用于 seek，
-                // 否则放行给控制条做按钮焦点导航（与 Kodi 行为一致）。
-                if (isHardwareSeekKey || inSeekMode || !isControllerVisible) {
-                    handleSeekPress(forward = isForwardKey)
-                    return true
-                }
+                // 左右方向键/快进快退键始终用作 seek：点按 = 单步跳，
+                // 长按 = key repeat 自动连发，handleSeekPress 会累加步长并加速（Kodi 风格）。
+                // 不再看是否控制条可见 —— 该遥控把 21/22 定位成独立的快进/快退键。
+                handleSeekPress(forward = isForwardKey)
+                return true
             }
         }
         return super.dispatchKeyEvent(event)
@@ -466,6 +512,8 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun playCurrent() {
+        // 新的 DLNA 片源来了：若正处于 Stop 软停窗口，取消到期的自动退出，无缝续播
+        cancelStopDebounce()
         mediaUri = playlist.getOrNull(currentIndex)
         mediaTitle = playlistTitles.getOrNull(currentIndex) ?: "DLNA 投屏 ${currentIndex + 1}/${playlist.size}"
         tvTitle.text = mediaTitle
@@ -720,6 +768,32 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
+    /** 遥控遥控键切集（备用映射）：频道 - 下一个、+ 上一个。播放列表为空时是空操作。 */
+    private fun playNextVideo() {
+        if (playlist.isEmpty()) return
+        currentIndex = (currentIndex + 1) % playlist.size
+        playCurrent()
+    }
+
+    /**
+     * 跳到当前视频末尾前 3 秒，让它自然播完并进入下一个视频。
+     *
+     * 故意不到精确末尾：seek 到 duration 时部分片源会直接进 ENDED 或停在末尾黑场，
+     * 检查不到正常的"播完→切下一集"。留 3 秒 Play（SEEK_TO_END_MARGIN_MS）让播放器
+     * 走真实的播完流程。未上报时长（如直播/流媒体）时跳过，避免误 seek 到最大值卡死。
+     */
+    private fun seekToEnd() {
+        val currentPlayer = player ?: return
+        val duration = currentPlayer.duration.takeIf { it > 0 } ?: return
+        currentPlayer.seekTo((duration - SEEK_TO_END_MARGIN_MS).coerceAtLeast(0L))
+    }
+
+    private fun playPrevVideo() {
+        if (playlist.isEmpty()) return
+        currentIndex = (currentIndex - 1 + playlist.size) % playlist.size
+        playCurrent()
+    }
+
     private fun isCurrentImage(): Boolean = mediaUri?.let { isImageUri(it) } == true
 
     private fun isImageUri(uri: String): Boolean {
@@ -951,6 +1025,7 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun stopPlayback() {
+        cancelStopDebounce()
         stopImageSlideShow()
         stopProgressUpdates()
         mirrorAspectJob?.cancel()
@@ -958,6 +1033,12 @@ class PlayerActivity : AppCompatActivity() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         player?.stop()
         reportPlaybackStopped()
+    }
+
+    /** 取消 DLNA Stop 软停窗口，继续复用本页（收到新片源时调用）。 */
+    private fun cancelStopDebounce() {
+        stopDebounceJob?.cancel()
+        stopDebounceJob = null
     }
 
     private fun startProgressUpdates() {
